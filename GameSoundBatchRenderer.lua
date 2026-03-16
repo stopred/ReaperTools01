@@ -1719,6 +1719,14 @@ end
 -- Dispatch mouse clicks to the topmost button under the cursor.
 local function gui_dispatch_mouse(ui)
   local mouse_down = (gfx.mouse_cap & 1) == 1
+  if ui.ignore_mouse_until_release then
+    if not mouse_down then
+      ui.ignore_mouse_until_release = false
+    end
+    ui.prev_mouse_down = mouse_down
+    return
+  end
+
   if mouse_down and not ui.prev_mouse_down then
     for index = #ui.buttons, 1, -1 do
       local button = ui.buttons[index]
@@ -2048,23 +2056,35 @@ local function run_gui(settings)
   local ui = {
     buttons = {},
     prev_mouse_down = false,
+    ignore_mouse_until_release = false,
     close_requested = false,
     current_preset_name = get_last_preset_name(),
     status_message = "Ready. Adjust settings, preview names, or render.",
   }
 
   gfx.init(SCRIPT_TITLE, 980, 960, 0)
+  ui.prev_mouse_down = (gfx.mouse_cap & 1) == 1
+  ui.ignore_mouse_until_release = ui.prev_mouse_down
 
-  while not ui.close_requested do
+  local function loop()
+    if ui.close_requested then
+      gfx.quit()
+      return
+    end
+
     local key = gfx.getchar()
     if key < 0 or key == 27 then
-      break
+      gfx.quit()
+      return
     end
 
     gui_draw(settings, ui)
     gui_dispatch_mouse(ui)
     gfx.update()
+    reaper.defer(loop)
   end
+
+  reaper.defer(loop)
 end
 
 -- Launch the GUI with the last saved settings.

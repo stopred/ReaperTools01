@@ -2728,11 +2728,18 @@ local function commit_imgui_change(state, changed)
   end
 end
 
+local function resolve_imgui_constant(value)
+  if type(value) == "function" then
+    return value()
+  end
+  return value
+end
+
 local function imgui_space_pressed(ctx)
   if not ImGui or not ImGui.IsKeyPressed or not ImGui.Key_Space then
     return false
   end
-  return ImGui.IsKeyPressed(ctx, ImGui.Key_Space())
+  return ImGui.IsKeyPressed(ctx, resolve_imgui_constant(ImGui.Key_Space))
 end
 
 local function draw_imgui_crossings(ctx, label, list)
@@ -2872,7 +2879,7 @@ local function run_imgui_loop(state)
     return
   end
 
-  ImGui.SetNextWindowSize(ctx, 700, 980, ImGui.Cond_FirstUseEver)
+  ImGui.SetNextWindowSize(ctx, 700, 980, resolve_imgui_constant(ImGui.Cond_FirstUseEver))
   local visible, open = ImGui.Begin(ctx, SCRIPT_TITLE, state.imgui_open)
   state.imgui_open = open
 

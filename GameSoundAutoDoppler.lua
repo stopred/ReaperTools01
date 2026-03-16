@@ -94,6 +94,21 @@ local DEFAULTS = {
   split_takes_after_render = false,
 }
 
+local function safe_imgui_symbol(name)
+  if not ImGui then
+    return nil
+  end
+
+  local symbol = nil
+  local ok = pcall(function()
+    symbol = ImGui[name]
+  end)
+  if not ok then
+    return nil
+  end
+  return symbol
+end
+
 local PLUGIN_ORDER = {
   "builtin",
   "waves_doppler",
@@ -2735,8 +2750,10 @@ local function imgui_loop()
     return
   end
 
-  if ImGui.SetNextWindowSize then
-    ImGui.SetNextWindowSize(ctx, 860, 920, ImGui.Cond_FirstUseEver or 0)
+  local set_next_window_size = safe_imgui_symbol("SetNextWindowSize")
+  local cond_first_use_ever = safe_imgui_symbol("Cond_FirstUseEver") or 0
+  if set_next_window_size then
+    set_next_window_size(ctx, 860, 920, cond_first_use_ever)
   end
 
   local visible, open = ImGui.Begin(ctx, SCRIPT_TITLE, ui_state.imgui_open)
@@ -2750,8 +2767,9 @@ local function imgui_loop()
 
   if not open or ui_state.should_close then
     save_settings_from_ui()
-    if ImGui.DestroyContext then
-      ImGui.DestroyContext(ctx)
+    local destroy_context = safe_imgui_symbol("DestroyContext")
+    if destroy_context then
+      destroy_context(ctx)
     end
     ui_state.imgui_context = nil
     return
@@ -2817,10 +2835,13 @@ function M.main()
   ui_state.selected_preset = get_selected_preset_slot()
 
   if HAS_IMGUI and ImGui then
-    ui_state.imgui_context = ImGui.CreateContext(SCRIPT_TITLE)
-    ui_state.imgui_open = true
-    imgui_loop()
-    return
+    local create_context = safe_imgui_symbol("CreateContext")
+    if create_context then
+      ui_state.imgui_context = create_context(SCRIPT_TITLE)
+      ui_state.imgui_open = true
+      imgui_loop()
+      return
+    end
   end
 
   gfx.init(SCRIPT_TITLE, WINDOW_W, WINDOW_H, 0)
