@@ -12,19 +12,32 @@ math.random()
 math.random()
 
 local WINDOW_W = 460
-local WINDOW_H = 250
+local WINDOW_H = 392 -- MOD
 local PADDING = 20
 local ROW_H = 42
 local SLIDER_W = 240
 local SLIDER_H = 18
 local BUTTON_W = 120
 local BUTTON_H = 30
+local ENVELOPE_SHAPE_SQUARE = 1 -- MOD
+local LOW_SHELF_API_BANDTYPE = 1 -- MOD
+local PRESENCE_API_BANDTYPE = 2 -- MOD
+local LOW_PASS_API_BANDTYPE = 5 -- MOD
+local LOW_SHELF_CONFIG_BANDTYPE = 0 -- MOD
+local PRESENCE_CONFIG_BANDTYPE = 8 -- MOD
+local LOW_PASS_CONFIG_BANDTYPE = 3 -- MOD
+local LOW_SHELF_FREQ = 100.0 -- MOD
+local PRESENCE_Q = 1.0 -- MOD
+local LOW_PASS_Q = 0.707 -- MOD
 
 local state = {
   variationCount = 10,
   pitchRangeSemitones = 4,
   volRangeDb = 3,
   panRangePercent = 20,
+  tone = 0.0, -- MOD
+  muteProbability = 0.0, -- MOD
+  reverseProbability = 0.0, -- MOD
   activeSlider = nil,
   prevMouseDown = false,
   statusText = "Ready",
@@ -63,6 +76,30 @@ local sliders = {
     step = 1,
     format = function(value) return string.format("%d%%", value) end,
   },
+  {
+    key = "tone",
+    label = "Tone",
+    min = 0,
+    max = 1,
+    step = 0.01,
+    format = function(value) return string.format("%.2f", value) end,
+  }, -- MOD
+  {
+    key = "muteProbability",
+    label = "MuteProbability",
+    min = 0,
+    max = 1,
+    step = 0.01,
+    format = function(value) return string.format("%.2f", value) end,
+  }, -- MOD
+  {
+    key = "reverseProbability",
+    label = "ReverseProbability",
+    min = 0,
+    max = 1,
+    step = 0.01,
+    format = function(value) return string.format("%.2f", value) end,
+  }, -- MOD
 }
 
 local generateButton = {
@@ -143,9 +180,13 @@ local function collect_selected_items()
     local item = reaper.GetSelectedMediaItem(0, index)
     if item then
       local position = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+      local length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH") -- MOD
+      local track = reaper.GetMediaItemTrack(item) -- MOD
       items[#items + 1] = {
         item = item,
         position = position,
+        length = length,
+        track = track, -- MOD
       }
 
       if not earliestPosition or position < earliestPosition then
@@ -155,6 +196,182 @@ local function collect_selected_items()
   end
 
   return items, earliestPosition
+end
+
+local function ensure_reaeq_tone_bands(track) -- MOD
+  local fxIndex = reaper.TrackFX_GetEQ(track, true)
+  if fxIndex < 0 then
+    return nil
+  end
+
+  local hasLowShelf = false
+  local hasPresence = false
+  local hasLowPass = false
+  local bandCount = 0
+
+  while true do
+    local ok, bandType = reaper.TrackFX_GetNamedConfigParm(track, fxIndex, "BANDTYPE" .. bandCount)
+    if not ok then
+      break
+    end
+
+    bandType = tonumber(bandType)
+    if bandType == LOW_SHELF_CONFIG_BANDTYPE then
+      hasLowShelf = true
+    elseif bandType == PRESENCE_CONFIG_BANDTYPE then
+      hasPresence = true
+    elseif bandType == LOW_PASS_CONFIG_BANDTYPE then
+      hasLowPass = true
+    end
+
+    bandCount = bandCount + 1
+  end
+
+  if bandCount >= 1 and not hasLowShelf then
+    reaper.TrackFX_SetNamedConfigParm(track, fxIndex, "BANDTYPE0", LOW_SHELF_CONFIG_BANDTYPE)
+  end
+  if bandCount >= 2 and not hasPresence then
+    reaper.TrackFX_SetNamedConfigParm(track, fxIndex, "BANDTYPE1", PRESENCE_CONFIG_BANDTYPE)
+  end
+  if bandCount >= 3 and not hasLowPass then
+    reaper.TrackFX_SetNamedConfigParm(track, fxIndex, "BANDTYPE2", LOW_PASS_CONFIG_BANDTYPE)
+  end
+
+  reaper.TrackFX_SetEQBandEnabled(track, fxIndex, LOW_SHELF_API_BANDTYPE, 0, true)
+  reaper.TrackFX_SetEQBandEnabled(track, fxIndex, PRESENCE_API_BANDTYPE, 0, true)
+  reaper.TrackFX_SetEQBandEnabled(track, fxIndex, LOW_PASS_API_BANDTYPE, 0, true)
+
+  reaper.TrackFX_SetEQParam(track, fxIndex, LOW_SHELF_API_BANDTYPE, 0, 0, LOW_SHELF_FREQ, false)
+  reaper.TrackFX_SetEQParam(track, fxIndex, PRESENCE_API_BANDTYPE, 0, 2, PRESENCE_Q, false)
+  reaper.TrackFX_SetEQParam(track, fxIndex, LOW_PASS_API_BANDTYPE, 0, 2, LOW_PASS_Q, false)
+
+  return fxIndex
+end
+
+local function find_reaeq_param_index(track, fxIndex, bandtype, bandidx, paramtype) -- MOD
+  local paramCount = reaper.TrackFX_GetNumParams(track, fxIndex)
+
+  for paramIndex = 0, paramCount - 1 do
+    local ok, currentBandType, currentBandIndex, currentParamType = reaper.TrackFX_GetEQParam(track, fxIndex, paramIndex)
+    if ok and currentBandType == bandtype and currentBandIndex == bandidx and currentParamType == paramtype then
+      return paramIndex
+    end
+  end
+
+  return nil
+end
+
+local function get_track_eq_context(track, cache) -- MOD
+  if cache[track] then
+    return cache[track]
+  end
+
+  local fxIndex = ensure_reaeq_tone_bands(track)
+  if not fxIndex then
+    return nil
+  end
+
+  local context = {
+    track = track,
+    fxIndex = fxIndex,
+    lowShelfGainParam = find_reaeq_param_index(track, fxIndex, LOW_SHELF_API_BANDTYPE, 0, 1),
+    presenceFreqParam = find_reaeq_param_index(track, fxIndex, PRESENCE_API_BANDTYPE, 0, 0),
+    presenceGainParam = find_reaeq_param_index(track, fxIndex, PRESENCE_API_BANDTYPE, 0, 1),
+    lowPassFreqParam = find_reaeq_param_index(track, fxIndex, LOW_PASS_API_BANDTYPE, 0, 0),
+  }
+
+  if not context.lowShelfGainParam
+    or not context.presenceFreqParam
+    or not context.presenceGainParam
+    or not context.lowPassFreqParam then
+    return nil
+  end
+
+  context.lowShelfGainEnv = reaper.GetFXEnvelope(track, fxIndex, context.lowShelfGainParam, true)
+  context.presenceFreqEnv = reaper.GetFXEnvelope(track, fxIndex, context.presenceFreqParam, true)
+  context.presenceGainEnv = reaper.GetFXEnvelope(track, fxIndex, context.presenceGainParam, true)
+  context.lowPassFreqEnv = reaper.GetFXEnvelope(track, fxIndex, context.lowPassFreqParam, true)
+
+  if not context.lowShelfGainEnv
+    or not context.presenceFreqEnv
+    or not context.presenceGainEnv
+    or not context.lowPassFreqEnv then
+    return nil
+  end
+
+  cache[track] = context
+  return context
+end
+
+local function write_fx_envelope_segment(envelope, startTime, endTime, normalizedValue) -- MOD
+  reaper.DeleteEnvelopePointRange(envelope, startTime, endTime)
+  reaper.InsertEnvelopePoint(
+    envelope,
+    startTime,
+    normalizedValue,
+    ENVELOPE_SHAPE_SQUARE,
+    0,
+    false,
+    true
+  )
+  reaper.InsertEnvelopePoint(
+    envelope,
+    endTime,
+    normalizedValue,
+    ENVELOPE_SHAPE_SQUARE,
+    0,
+    false,
+    true
+  )
+end
+
+local function apply_tone_variation(context, startTime, endTime, tone) -- MOD
+  local shelfGainDb = random_symmetric(6.0 * tone)
+  local presenceGainDb = random_symmetric(6.0 * tone)
+  local presenceFreq = 2000.0 + (math.random() * 2000.0)
+  local highCutFreq = 22000.0 - (10000.0 * tone) - (math.random() * 4000.0 * tone)
+
+  reaper.TrackFX_SetEQBandEnabled(context.track, context.fxIndex, LOW_SHELF_API_BANDTYPE, 0, true)
+  reaper.TrackFX_SetEQBandEnabled(context.track, context.fxIndex, PRESENCE_API_BANDTYPE, 0, true)
+  reaper.TrackFX_SetEQBandEnabled(context.track, context.fxIndex, LOW_PASS_API_BANDTYPE, 0, true)
+
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, LOW_SHELF_API_BANDTYPE, 0, 0, LOW_SHELF_FREQ, false)
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, LOW_SHELF_API_BANDTYPE, 0, 1, shelfGainDb, false)
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, PRESENCE_API_BANDTYPE, 0, 0, presenceFreq, false)
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, PRESENCE_API_BANDTYPE, 0, 1, presenceGainDb, false)
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, PRESENCE_API_BANDTYPE, 0, 2, PRESENCE_Q, false)
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, LOW_PASS_API_BANDTYPE, 0, 0, highCutFreq, false)
+  reaper.TrackFX_SetEQParam(context.track, context.fxIndex, LOW_PASS_API_BANDTYPE, 0, 2, LOW_PASS_Q, false)
+
+  write_fx_envelope_segment(
+    context.lowShelfGainEnv,
+    startTime,
+    endTime,
+    reaper.TrackFX_GetParamNormalized(context.track, context.fxIndex, context.lowShelfGainParam)
+  )
+  write_fx_envelope_segment(
+    context.presenceFreqEnv,
+    startTime,
+    endTime,
+    reaper.TrackFX_GetParamNormalized(context.track, context.fxIndex, context.presenceFreqParam)
+  )
+  write_fx_envelope_segment(
+    context.presenceGainEnv,
+    startTime,
+    endTime,
+    reaper.TrackFX_GetParamNormalized(context.track, context.fxIndex, context.presenceGainParam)
+  )
+  write_fx_envelope_segment(
+    context.lowPassFreqEnv,
+    startTime,
+    endTime,
+    reaper.TrackFX_GetParamNormalized(context.track, context.fxIndex, context.lowPassFreqParam)
+  )
+
+  reaper.Envelope_SortPoints(context.lowShelfGainEnv)
+  reaper.Envelope_SortPoints(context.presenceFreqEnv)
+  reaper.Envelope_SortPoints(context.presenceGainEnv)
+  reaper.Envelope_SortPoints(context.lowPassFreqEnv)
 end
 
 local function apply_random_take_variation(item, pitchRange, volRangeDb, panRangePercent)
@@ -176,6 +393,30 @@ local function apply_random_take_variation(item, pitchRange, volRangeDb, panRang
   reaper.SetMediaItemTakeInfo_Value(take, "D_PAN", clamp(basePan + panOffset, -1.0, 1.0))
 end
 
+local function reverse_generated_items(itemsToReverse, sourceItems) -- MOD
+  if #itemsToReverse == 0 then
+    return
+  end
+
+  reaper.SelectAllMediaItems(0, false)
+
+  for _, item in ipairs(itemsToReverse) do
+    if item then
+      reaper.SetMediaItemSelected(item, true)
+    end
+  end
+
+  reaper.Main_OnCommand(41051, 0)
+
+  reaper.SelectAllMediaItems(0, false)
+
+  for _, source in ipairs(sourceItems) do
+    if source.item then
+      reaper.SetMediaItemSelected(source.item, true)
+    end
+  end
+end
+
 local function generate_variations()
   local sourceItems, earliestPosition = collect_selected_items()
   if #sourceItems == 0 or not earliestPosition then
@@ -187,15 +428,33 @@ local function generate_variations()
   reaper.PreventUIRefresh(1)
 
   local createdCount = 0
+  local eqContexts = {} -- MOD
+  local itemsToReverse = {} -- MOD
   local ok, errorMessage = pcall(function() -- MOD
     for variationIndex = 1, state.variationCount do
       local variationBasePosition = variationIndex - 1
+      local variationTrackRanges = {} -- MOD
 
       for _, source in ipairs(sourceItems) do
         local duplicatedItem = duplicate_item(source.item)
         if duplicatedItem then
           local relativeOffset = source.position - earliestPosition
           local newPosition = variationBasePosition + relativeOffset
+          local trackRange = variationTrackRanges[source.track] -- MOD
+          if not trackRange then
+            trackRange = {
+              startTime = newPosition,
+              endTime = newPosition + source.length,
+            }
+            variationTrackRanges[source.track] = trackRange
+          else
+            if newPosition < trackRange.startTime then
+              trackRange.startTime = newPosition
+            end
+            if (newPosition + source.length) > trackRange.endTime then
+              trackRange.endTime = newPosition + source.length
+            end
+          end
 
           reaper.SetMediaItemInfo_Value(duplicatedItem, "D_POSITION", newPosition)
           reaper.SetMediaItemSelected(duplicatedItem, false)
@@ -205,10 +464,25 @@ local function generate_variations()
             state.volRangeDb,
             state.panRangePercent
           )
+          if math.random() < state.muteProbability then -- MOD
+            reaper.SetMediaItemInfo_Value(duplicatedItem, "B_MUTE", 1)
+          end
+          if math.random() < state.reverseProbability and reaper.GetActiveTake(duplicatedItem) then -- MOD
+            itemsToReverse[#itemsToReverse + 1] = duplicatedItem
+          end
           createdCount = createdCount + 1
         end
       end
+
+      for track, range in pairs(variationTrackRanges) do -- MOD
+        local eqContext = get_track_eq_context(track, eqContexts)
+        if eqContext then
+          apply_tone_variation(eqContext, range.startTime, range.endTime, state.tone)
+        end
+      end
     end
+
+    reverse_generated_items(itemsToReverse, sourceItems) -- MOD
   end)
 
   reaper.PreventUIRefresh(-1)
