@@ -7,10 +7,10 @@
 -- [Batch]   Crawl every top-level folder recipe in the current project.
 -- [Export]  Write Markdown, CSV, and/or JSON recipe documents.
 --
--- Phase 1 status:
--- - Implemented: single recipe crawl, batch crawl, console report, Markdown/CSV/JSON export,
---   source file inspection, FX chain capture, notes/tags prompt, ExtState persistence.
--- - Planned later: rebuild from JSON, recipe diff, gfx GUI.
+-- Phase 3 status:
+-- - Implemented: crawl/export flow, batch crawl, recipe book export, notes/tags,
+--   gfx UI, rebuild from JSON, recipe diff, custom library patterns.
+-- - Remaining future ideas: richer compare/rebuild UI, deeper plugin-specific restore rules.
 --
 -- Requirements: REAPER v7.0+
 -- Related scripts: GameSoundLayeringTemplate.lua,
@@ -25,12 +25,30 @@ local REAPER_COLOR_FLAG = 0x1000000
 
 local DEFAULTS = {
   mode = "single",
+  source_scope = "selected_folder",
   output_format = "markdown",
   output_folder = "",
+  export_console = true,
+  export_markdown = true,
+  export_csv = false,
+  export_json = false,
+  include_source_info = true,
   include_fx_parameters = true,
+  verbose_fx_parameters = false,
   include_file_paths = true,
+  include_sends = true,
   add_notes_prompt = true,
+  auto_detect_library = true,
+  auto_tag_keywords = false,
   prefix_filter = "",
+  rebuild_json_path = "",
+  compare_old_json_path = "",
+  compare_new_json_path = "",
+  rebuild_restore_fx = true,
+  rebuild_restore_master_fx = true,
+  rebuild_restore_sends = true,
+  rebuild_create_missing_send_tracks = true,
+  custom_library_patterns = "",
 }
 
 local KNOWN_LIBRARY_PATTERNS = {
@@ -46,6 +64,23 @@ local KNOWN_LIBRARY_PATTERNS = {
   { "Personal Recording", { "recording", "field_rec", "fieldrec", "foley", "captures" } },
   { "Synthesized",        { "synth", "generated", "procedural", "designed" } },
 }
+
+local AUTO_TAG_KEYWORDS = {
+  SFX_Weapon = { "weapon", "combat", "attack", "impact" },
+  SFX_Footstep = { "footstep", "foley", "movement", "surface" },
+  SFX_Explosion = { "explosion", "blast", "debris" },
+  SFX_Impact = { "impact", "hit", "collision" },
+  SFX_Creature = { "creature", "vocal", "monster" },
+  UI_Menu = { "ui", "menu", "interface" },
+  UI_Button = { "ui", "button", "click" },
+  AMB_Nature = { "ambience", "nature", "environment" },
+  AMB_Indoor = { "ambience", "indoor", "room" },
+  MUS_BGM = { "music", "bgm", "score" },
+  VO_Dialogue = { "voice", "dialogue", "speech" },
+  FOL_Cloth = { "foley", "cloth", "fabric" },
+}
+
+local CUSTOM_LIBRARY_PATTERNS = {}
 
 local FX_NAME_PREFIXES = {
   "VST3: ",
@@ -168,6 +203,78 @@ local function parse_output_format(value, default_value)
     return "all"
   end
   return default_value
+end
+
+local function parse_source_scope(value, default_value)
+  local lowered = trim_string(value):lower()
+  if lowered == "selected" or lowered == "selected_folder" or lowered == "selected_folder_track" then
+    return "selected_folder"
+  end
+  if lowered == "all" or lowered == "all_folders" or lowered == "all_folder_tracks" then
+    return "all_folder_tracks"
+  end
+  return default_value
+end
+
+local function apply_export_flags_from_output_format(settings)
+  local output_format = parse_output_format(settings.output_format, DEFAULTS.output_format)
+  settings.output_format = output_format
+  settings.export_console = true
+  settings.export_markdown = false
+  settings.export_csv = false
+  settings.export_json = false
+
+  if output_format == "markdown" then
+    settings.export_markdown = true
+  elseif output_format == "csv" then
+    settings.export_csv = true
+  elseif output_format == "json" then
+    settings.export_json = true
+  elseif output_format == "all" then
+    settings.export_markdown = true
+    settings.export_csv = true
+    settings.export_json = true
+  end
+end
+
+local function derive_output_format_from_flags(settings)
+  local console_on = settings.export_console ~= false
+  local markdown_on = settings.export_markdown == true
+  local csv_on = settings.export_csv == true
+  local json_on = settings.export_json == true
+
+  if console_on and markdown_on and csv_on and json_on then
+    return "all"
+  end
+  if console_on and markdown_on and not csv_on and not json_on then
+    return "markdown"
+  end
+  if console_on and csv_on and not markdown_on and not json_on then
+    return "csv"
+  end
+  if console_on and json_on and not markdown_on and not csv_on then
+    return "json"
+  end
+  if console_on and not markdown_on and not csv_on and not json_on then
+    return "console"
+  end
+  if markdown_on and csv_on and json_on then
+    return "all"
+  end
+  if markdown_on then
+    return "markdown"
+  end
+  if csv_on then
+    return "csv"
+  end
+  if json_on then
+    return "json"
+  end
+  return "console"
+end
+
+local function has_any_output_enabled(settings)
+  return settings.export_console or settings.export_markdown or settings.export_csv or settings.export_json
 end
 
 local function normalize_path(path)
@@ -353,6 +460,10 @@ local function linear_to_db(linear_value)
   return 20.0 * log10(safe)
 end
 
+local function db_to_linear(db_value)
+  return 10 ^ ((tonumber(db_value) or 0.0) / 20.0)
+end
+
 local function format_db(db_value)
   if db_value == nil then
     return "N/A"
@@ -442,6 +553,18 @@ local function classify_fade_shape(shape_index, curvature)
   return label
 end
 
+local function hex_to_native_color(color_hex)
+  local hex = trim_string(color_hex)
+  local red, green, blue = hex:match("^#?(%x%x)(%x%x)(%x%x)$")
+  if not red then
+    return nil
+  end
+  local r = tonumber(red, 16) or 0
+  local g = tonumber(green, 16) or 0
+  local b = tonumber(blue, 16) or 0
+  return reaper.ColorToNative(r, g, b) + REAPER_COLOR_FLAG
+end
+
 local function escape_markdown_cell(value)
   local text = tostring(value or "")
   text = text:gsub("\r\n", "\n")
@@ -480,6 +603,106 @@ local function parse_tags(value)
   end
 
   return tags
+end
+
+local function merge_tags(base_tags, extra_tags)
+  local merged = {}
+  local seen = {}
+
+  for _, tag in ipairs(base_tags or {}) do
+    local clean = trim_string(tag)
+    if clean ~= "" then
+      local key = clean:lower()
+      if not seen[key] then
+        seen[key] = true
+        merged[#merged + 1] = clean
+      end
+    end
+  end
+
+  for _, tag in ipairs(extra_tags or {}) do
+    local clean = trim_string(tag)
+    if clean ~= "" then
+      local key = clean:lower()
+      if not seen[key] then
+        seen[key] = true
+        merged[#merged + 1] = clean
+      end
+    end
+  end
+
+  return merged
+end
+
+local function build_auto_tags(recipe_name)
+  local tags = {}
+  local normalized = tostring(recipe_name or "")
+  local upper_name = normalized:upper()
+
+  for prefix, keyword_tags in pairs(AUTO_TAG_KEYWORDS) do
+    if upper_name:find(prefix:upper(), 1, true) then
+      tags = merge_tags(tags, keyword_tags)
+    end
+  end
+
+  for token in normalized:gmatch("[A-Za-z0-9]+") do
+    local lowered = token:lower()
+    if #lowered >= 4 and lowered ~= "sfx" and lowered ~= "amb" and lowered ~= "mus" and lowered ~= "ui" and lowered ~= "vo" and lowered ~= "fol" then
+      tags = merge_tags(tags, { lowered })
+    end
+  end
+
+  return tags
+end
+
+local function serialize_custom_library_patterns(patterns)
+  local entries = {}
+
+  for _, entry in ipairs(patterns or {}) do
+    local name = trim_string(entry.name)
+    local pattern_list = {}
+
+    for _, pattern in ipairs(entry.patterns or {}) do
+      local clean = trim_string(pattern)
+      if clean ~= "" then
+        pattern_list[#pattern_list + 1] = clean
+      end
+    end
+
+    if name ~= "" and #pattern_list > 0 then
+      entries[#entries + 1] = name .. "=" .. table.concat(pattern_list, ";")
+    end
+  end
+
+  return table.concat(entries, "||")
+end
+
+local function parse_custom_library_patterns(blob)
+  local patterns = {}
+  local text = tostring(blob or "")
+  local entries = split_delimited(text, "||", 1)
+
+  for _, entry_text in ipairs(entries) do
+    local name, pattern_text = entry_text:match("^%s*(.-)%s*=%s*(.-)%s*$")
+    if name and pattern_text and name ~= "" and pattern_text ~= "" then
+      local entry = { name = name, patterns = {} }
+      for pattern in pattern_text:gmatch("[^;]+") do
+        local clean = trim_string(pattern)
+        if clean ~= "" then
+          entry.patterns[#entry.patterns + 1] = clean:lower()
+        end
+      end
+      if #entry.patterns > 0 then
+        patterns[#patterns + 1] = entry
+      end
+    end
+  end
+
+  return patterns
+end
+
+local function refresh_custom_library_patterns(blob)
+  CUSTOM_LIBRARY_PATTERNS = parse_custom_library_patterns(blob)
 end
 
 local function get_track_name(track)
@@ -717,6 +940,14 @@ local function guess_library_name(filepath, source_type)
       for _, pattern in ipairs(patterns) do
         if normalized:find(pattern, 1, true) then
           return library_name
+        end
+      end
+    end
+
+    for _, library in ipairs(CUSTOM_LIBRARY_PATTERNS) do
+      for _, pattern in ipairs(library.patterns or {}) do
+        if normalized:find(pattern, 1, true) then
+          return library.name
         end
       end
     end
@@ -1185,6 +1416,7 @@ local function collect_take_state(take, source_info)
     offset = round_to(start_offset, 6),
     preserve_pitch = preserve_pitch,
     pitch_mode = decode_pitch_mode(pitch_mode),
+    pitch_mode_raw = pitch_mode,
   }
 end
 
@@ -1438,6 +1670,51 @@ local function format_take_flags(ingredient)
   return flags
 end
 
+local function filter_fx_parameters_for_display(fx, verbose)
+  if verbose then
+    return fx.parameters
+  end
+
+  local lowered = trim_string(fx.name):lower()
+  local filtered = {}
+
+  local function add_if_matches(tokens)
+    for _, parameter in ipairs(fx.parameters) do
+      local parameter_name = parameter.name:lower()
+      for _, token in ipairs(tokens) do
+        if parameter_name:find(token, 1, true) then
+          filtered[#filtered + 1] = parameter
+          break
+        end
+      end
+    end
+  end
+
+  if lowered:find("reaeq", 1, true) then
+    add_if_matches({ "enabled", "type", "freq", "frequency", "gain", "q", "bandwidth" })
+  elseif lowered:find("reacomp", 1, true) then
+    add_if_matches({ "thresh", "ratio", "attack", "release", "knee", "pre-comp", "rms" })
+  elseif lowered:find("reaverb", 1, true) or lowered:find("verb", 1, true) then
+    add_if_matches({ "room", "size", "damp", "wet", "dry", "predelay" })
+  elseif lowered:find("readelay", 1, true) or lowered:find("delay", 1, true) then
+    add_if_matches({ "time", "length", "feedback", "wet", "dry" })
+  else
+    for _, parameter in ipairs(fx.parameters) do
+      if trim_string(parameter.display) ~= "" then
+        filtered[#filtered + 1] = parameter
+      end
+      if #filtered >= 8 then
+        break
+      end
+    end
+  end
+
+  if #filtered == 0 then
+    return fx.parameters
+  end
+  return filtered
+end
+
 local function print_recipe_report(recipe, settings)
   local master_fx_names = {}
   for _, fx in ipairs(recipe.master_fx) do
@@ -1483,14 +1760,18 @@ local function print_recipe_report(recipe, settings)
     log_line(string.format("  Layer %d: %s", index, ingredient.layer_label))
     log_line("  " .. repeat_char("-", REPORT_WIDTH - 4))
     log_line("  Source:    " .. ingredient.source.filename)
-    log_line("     Library:   " .. (ingredient.source.library_name or "Unknown"))
-    if settings.include_file_paths then
+    if settings.include_source_info and settings.auto_detect_library then
+      log_line("     Library:   " .. (ingredient.source.library_name or "Unknown"))
+    end
+    if settings.include_source_info and settings.include_file_paths then
       log_line("     Path:      " .. (ingredient.source.filepath ~= "" and ingredient.source.filepath or "(none)"))
     end
-    if ingredient.source.file_exists == false and ingredient.source.filepath ~= "" then
+    if settings.include_source_info and ingredient.source.file_exists == false and ingredient.source.filepath ~= "" then
       log_line("     Warning:   source file not found on disk")
     end
-    log_line("     Original:  " .. format_source_overview(ingredient.source))
+    if settings.include_source_info then
+      log_line("     Original:  " .. format_source_overview(ingredient.source))
+    end
     log_line("     Used:      " .. ingredient.item.used_range .. " (" .. format_seconds(ingredient.item.source_time_span or ingredient.item.length or 0, ingredient.source.source_length_is_qn and "qn" or nil) .. ")")
 
     log_line("")
@@ -1529,18 +1810,20 @@ local function print_recipe_report(recipe, settings)
       end
     end
 
-    log_line("")
-    log_line("  Sends:")
-    if #ingredient.sends == 0 then
-      log_line("     (none)")
-    else
-      for _, send in ipairs(ingredient.sends) do
-        log_line(string.format(
-          "     -> %s (%s, %s)",
-          send.dest_track_name,
-          format_db(send.send_volume_db),
-          format_pan_short(send.send_pan)
-        ))
+    if settings.include_sends then
+      log_line("")
+      log_line("  Sends:")
+      if #ingredient.sends == 0 then
+        log_line("     (none)")
+      else
+        for _, send in ipairs(ingredient.sends) do
+          log_line(string.format(
+            "     -> %s (%s, %s)",
+            send.dest_track_name,
+            format_db(send.send_volume_db),
+            format_pan_short(send.send_pan)
+          ))
+        end
       end
     end
   end
@@ -1550,9 +1833,13 @@ local function print_recipe_report(recipe, settings)
   log_line("  Recipe Summary")
   log_line("  " .. repeat_char("-", REPORT_WIDTH - 4))
   log_line("  Source Files:   " .. tostring(count_unique_sources(recipe)))
-  log_line("  Libraries:      " .. (#libraries > 0 and table.concat(libraries, ", ") or "(none)"))
+  if settings.auto_detect_library then
+    log_line("  Libraries:      " .. (#libraries > 0 and table.concat(libraries, ", ") or "(none)"))
+  end
   log_line("  Total FX:       " .. tostring(count_total_fx(recipe)))
-  log_line("  Total Sends:    " .. tostring(count_total_sends(recipe)))
+  if settings.include_sends then
+    log_line("  Total Sends:    " .. tostring(count_total_sends(recipe)))
+  end
   log_line(string.format("  Pitch Range:    %+.0f to %+.0f cents", pitch_min or 0, pitch_max or 0))
   log_line(string.format("  Volume Range:   %s to %s", format_db(volume_min), format_db(volume_max)))
   log_line(repeat_char("=", REPORT_WIDTH))
@@ -1569,7 +1856,325 @@ local function write_text_file(path, content)
   return true
 end
 
-local function append_markdown_fx_chain(lines, heading_level, title, fx_chain, include_parameters)
+local function read_text_file(path)
+  local handle, open_error = io.open(path, "rb")
+  if not handle then
+    return nil, open_error
+  end
+
+  local content = handle:read("*a")
+  handle:close()
+  return content
+end
+
+local function prompt_json_file(title, default_path)
+  local initial_path = trim_string(default_path)
+  if initial_path == "" then
+    initial_path = resolve_output_dir("")
+  end
+
+  local ok, path = reaper.GetUserFileNameForRead(initial_path, title, ".json")
+  if not ok or trim_string(path) == "" then
+    return nil, "User cancelled."
+  end
+
+  return normalize_path(path)
+end
+
+local function prompt_yes_no_options(title, fields)
+  local captions = { "separator=|" }
+  local defaults = {}
+
+  for _, field in ipairs(fields or {}) do
+    captions[#captions + 1] = field.label
+    defaults[#defaults + 1] = bool_to_string(field.value)
+  end
+
+  local ok, values = reaper.GetUserInputs(
+    title,
+    #fields,
+    table.concat(captions, ","),
+    table.concat(defaults, "|")
+  )
+
+  if not ok then
+    return nil, "User cancelled."
+  end
+
+  local parts = split_delimited(values, "|", #fields)
+  local result = {}
+  for index, field in ipairs(fields) do
+    result[field.key] = parse_boolean(parts[index], field.value)
+  end
+  return result
+end
+
+local function parse_json(text)
+  local position = 1
+  local text_length = #text
+
+  local function skip_whitespace()
+    while position <= text_length do
+      local char = text:sub(position, position)
+      if char ~= " " and char ~= "\t" and char ~= "\r" and char ~= "\n" then
+        break
+      end
+      position = position + 1
+    end
+  end
+
+  local parse_value
+
+  local function parse_error(message)
+    error(string.format("JSON parse error at position %d: %s", position, message))
+  end
+
+  local function parse_string()
+    if text:sub(position, position) ~= "\"" then
+      parse_error("expected string")
+    end
+
+    position = position + 1
+    local output = {}
+
+    while position <= text_length do
+      local char = text:sub(position, position)
+      if char == "\"" then
+        position = position + 1
+        return table.concat(output)
+      end
+
+      if char == "\\" then
+        local escaped = text:sub(position + 1, position + 1)
+        if escaped == "\"" or escaped == "\\" or escaped == "/" then
+          output[#output + 1] = escaped
+          position = position + 2
+        elseif escaped == "b" then
+          output[#output + 1] = "\b"
+          position = position + 2
+        elseif escaped == "f" then
+          output[#output + 1] = "\f"
+          position = position + 2
+        elseif escaped == "n" then
+          output[#output + 1] = "\n"
+          position = position + 2
+        elseif escaped == "r" then
+          output[#output + 1] = "\r"
+          position = position + 2
+        elseif escaped == "t" then
+          output[#output + 1] = "\t"
+          position = position + 2
+        elseif escaped == "u" then
+          local hex = text:sub(position + 2, position + 5)
+          if not hex:match("^%x%x%x%x$") then
+            parse_error("invalid unicode escape")
+          end
+          local codepoint = tonumber(hex, 16) or 32
+          if utf8 and utf8.char and codepoint <= 0x10FFFF then
+            output[#output + 1] = utf8.char(codepoint)
+          else
+            output[#output + 1] = "?"
+          end
+          position = position + 6
+        else
+          parse_error("invalid escape sequence")
+        end
+      else
+        output[#output + 1] = char
+        position = position + 1
+      end
+    end
+
+    parse_error("unterminated string")
+  end
+
+  local function parse_number()
+    local start_pos = position
+    local remainder = text:sub(position)
+    local number_text = remainder:match("^-?%d+%.?%d*[eE]?[+-]?%d*")
+    if not number_text or number_text == "" then
+      number_text = remainder:match("^-?%.%d+[eE]?[+-]?%d*")
+    end
+    if not number_text or number_text == "" then
+      parse_error("invalid number")
+    end
+    position = start_pos + #number_text
+    local number_value = tonumber(number_text)
+    if number_value == nil then
+      parse_error("invalid numeric literal")
+    end
+    return number_value
+  end
+
+  local function parse_array()
+    local result = {}
+    position = position + 1
+    skip_whitespace()
+    if text:sub(position, position) == "]" then
+      position = position + 1
+      return result
+    end
+
+    while true do
+      result[#result + 1] = parse_value()
+      skip_whitespace()
+      local char = text:sub(position, position)
+      if char == "]" then
+        position = position + 1
+        return result
+      end
+      if char ~= "," then
+        parse_error("expected ',' or ']'")
+      end
+      position = position + 1
+      skip_whitespace()
+    end
+  end
+
+  local function parse_object()
+    local result = {}
+    position = position + 1
+    skip_whitespace()
+    if text:sub(position, position) == "}" then
+      position = position + 1
+      return result
+    end
+
+    while true do
+      skip_whitespace()
+      local key = parse_string()
+      skip_whitespace()
+      if text:sub(position, position) ~= ":" then
+        parse_error("expected ':'")
+      end
+      position = position + 1
+      skip_whitespace()
+      result[key] = parse_value()
+      skip_whitespace()
+      local char = text:sub(position, position)
+      if char == "}" then
+        position = position + 1
+        return result
+      end
+      if char ~= "," then
+        parse_error("expected ',' or '}'")
+      end
+      position = position + 1
+      skip_whitespace()
+    end
+  end
+
+  parse_value = function()
+    skip_whitespace()
+    local char = text:sub(position, position)
+    if char == "\"" then
+      return parse_string()
+    end
+    if char == "{" then
+      return parse_object()
+    end
+    if char == "[" then
+      return parse_array()
+    end
+    if char == "-" or char:match("%d") then
+      return parse_number()
+    end
+    if text:sub(position, position + 3) == "true" then
+      position = position + 4
+      return true
+    end
+    if text:sub(position, position + 4) == "false" then
+      position = position + 5
+      return false
+    end
+    if text:sub(position, position + 3) == "null" then
+      position = position + 4
+      return nil
+    end
+    parse_error("unexpected token")
+  end
+
+  local ok, value_or_error = pcall(function()
+    local value = parse_value()
+    skip_whitespace()
+    if position <= text_length then
+      parse_error("trailing characters")
+    end
+    return value
+  end)
+
+  if not ok then
+    return nil, value_or_error
+  end
+
+  return value_or_error
+end
+
+local function choose_recipe_from_payload(payload, source_path, prompt_title)
+  if type(payload) ~= "table" then
+    return nil, "Selected JSON does not contain a valid recipe payload."
+  end
+
+  if payload.ingredients then
+    return payload
+  end
+
+  if #payload == 0 then
+    return nil, "Selected JSON does not contain any recipes."
+  end
+
+  if #payload == 1 and type(payload[1]) == "table" then
+    return payload[1]
+  end
+
+  clear_console()
+  log_line("Recipe choices from: " .. tostring(source_path))
+  for index, recipe in ipairs(payload) do
+    log_line(string.format("  [%d] %s", index, tostring(recipe.name or ("Recipe " .. index))))
+  end
+
+  local ok, value = reaper.GetUserInputs(
+    prompt_title or (SCRIPT_TITLE .. " - Select Recipe"),
+    1,
+    "Recipe Index or Name",
+    "1"
+  )
+  if not ok then
+    return nil, "User cancelled."
+  end
+
+  local token = trim_string(value)
+  local numeric_index = tonumber(token)
+  if numeric_index then
+    numeric_index = math.floor(clamp_number(numeric_index, 1, #payload))
+    return payload[numeric_index]
+  end
+
+  local lowered = token:lower()
+  for _, recipe in ipairs(payload) do
+    if trim_string(recipe.name):lower() == lowered then
+      return recipe
+    end
+  end
+
+  return nil, "No recipe matched '" .. token .. "'."
+end
+
+local function load_recipe_from_json_path(path, prompt_title)
+  local content, read_error = read_text_file(path)
+  if not content then
+    return nil, "Could not read JSON file: " .. tostring(read_error)
+  end
+
+  local payload, parse_error_message = parse_json(content)
+  if not payload then
+    return nil, parse_error_message
+  end
+
+  return choose_recipe_from_payload(payload, path, prompt_title)
+end
+
+local function append_markdown_fx_chain(lines, heading_level, title, fx_chain, settings)
   if #fx_chain == 0 then
     return
   end
@@ -1596,15 +2201,16 @@ local function append_markdown_fx_chain(lines, heading_level, title, fx_chain, i
 
   lines[#lines + 1] = ""
 
-  if include_parameters then
+  if settings.include_fx_parameters then
     for index, fx in ipairs(fx_chain) do
-      if #fx.parameters > 0 then
+      local parameter_list = filter_fx_parameters_for_display(fx, settings.verbose_fx_parameters)
+      if #parameter_list > 0 then
         lines[#lines + 1] = heading_prefix .. "# [" .. tostring(index) .. "] " .. escape_markdown_cell(fx.name)
         lines[#lines + 1] = ""
         lines[#lines + 1] = "| Param | Display | Normalized |"
         lines[#lines + 1] = "|-------|---------|------------|"
 
-        for _, parameter in ipairs(fx.parameters) do
+        for _, parameter in ipairs(parameter_list) do
           lines[#lines + 1] = string.format(
             "| %s | %s | %.6f |",
             escape_markdown_cell(parameter.name),
@@ -1652,7 +2258,7 @@ local function export_recipe_markdown(recipe, filepath, settings)
   lines[#lines + 1] = "---"
   lines[#lines + 1] = ""
 
-  append_markdown_fx_chain(lines, 2, "Master FX Chain", recipe.master_fx, settings.include_fx_parameters)
+  append_markdown_fx_chain(lines, 2, "Master FX Chain", recipe.master_fx, settings)
 
   for index, ingredient in ipairs(recipe.ingredients) do
     local flags = format_take_flags(ingredient)
@@ -1663,13 +2269,19 @@ local function export_recipe_markdown(recipe, filepath, settings)
     lines[#lines + 1] = "| Field | Value |"
     lines[#lines + 1] = "|-------|-------|"
     lines[#lines + 1] = "| File | `" .. escape_inline_code(ingredient.source.filename) .. "` |"
-    lines[#lines + 1] = "| Library | " .. escape_markdown_cell(ingredient.source.library_name or "Unknown") .. " |"
-    lines[#lines + 1] = "| Exists On Disk | " .. tostring(ingredient.source.file_exists and "Yes" or "No") .. " |"
-    if settings.include_file_paths then
+    if settings.include_source_info and settings.auto_detect_library then
+      lines[#lines + 1] = "| Library | " .. escape_markdown_cell(ingredient.source.library_name or "Unknown") .. " |"
+    end
+    if settings.include_source_info then
+      lines[#lines + 1] = "| Exists On Disk | " .. tostring(ingredient.source.file_exists and "Yes" or "No") .. " |"
+    end
+    if settings.include_source_info and settings.include_file_paths then
       lines[#lines + 1] = "| Path | `" .. escape_inline_code(ingredient.source.filepath ~= "" and ingredient.source.filepath or "(none)") .. "` |"
     end
-    lines[#lines + 1] = "| Original | " .. escape_markdown_cell(format_source_overview(ingredient.source)) .. " |"
-    if ingredient.source.file_size_kb then
+    if settings.include_source_info then
+      lines[#lines + 1] = "| Original | " .. escape_markdown_cell(format_source_overview(ingredient.source)) .. " |"
+    end
+    if settings.include_source_info and ingredient.source.file_size_kb then
       lines[#lines + 1] = "| File Size | " .. string.format("%.1f KB", ingredient.source.file_size_kb) .. " |"
     end
     lines[#lines + 1] = "| Used Range | " .. escape_markdown_cell(ingredient.item.used_range) .. " |"
@@ -1698,9 +2310,9 @@ local function export_recipe_markdown(recipe, filepath, settings)
     end
     lines[#lines + 1] = ""
 
-    append_markdown_fx_chain(lines, 3, "FX Chain", ingredient.fx_chain, settings.include_fx_parameters)
+    append_markdown_fx_chain(lines, 3, "FX Chain", ingredient.fx_chain, settings)
 
-    if #ingredient.sends > 0 then
+    if settings.include_sends and #ingredient.sends > 0 then
       lines[#lines + 1] = "### Sends"
       lines[#lines + 1] = "| Destination | Volume | Pan |"
       lines[#lines + 1] = "|-------------|--------|-----|"
@@ -1731,7 +2343,7 @@ local function export_recipe_markdown(recipe, filepath, settings)
   return write_text_file(filepath, table.concat(lines, "\n"))
 end
 
-local function build_csv_rows_for_recipe(recipe)
+local function build_csv_rows_for_recipe(recipe, settings)
   local rows = {}
 
   for index, ingredient in ipairs(recipe.ingredients) do
@@ -1753,7 +2365,7 @@ local function build_csv_rows_for_recipe(recipe)
       tostring(index),
       ingredient.track.name,
       ingredient.source.filename,
-      ingredient.source.library_name or "Unknown",
+      settings.include_source_info and settings.auto_detect_library and (ingredient.source.library_name or "Unknown") or "",
       string.format("%.3f", ingredient.item.length or 0),
       tostring(ingredient.take.pitch_cents or 0),
       string.format("%.1f", ingredient.take.volume_db or 0),
@@ -1763,8 +2375,8 @@ local function build_csv_rows_for_recipe(recipe)
       fx_columns[1],
       fx_columns[2],
       fx_columns[3],
-      table.concat(send_names, "; "),
-      table.concat(send_volumes, "; "),
+      settings.include_sends and table.concat(send_names, "; ") or "",
+      settings.include_sends and table.concat(send_volumes, "; ") or "",
     }
   end
 
@@ -1784,7 +2396,7 @@ local function write_csv_file(filepath, rows)
   return write_text_file(filepath, table.concat(lines, "\n"))
 end
 
-local function export_recipe_csv(recipe, filepath)
+local function export_recipe_csv(recipe, filepath, settings)
   local rows = {
     {
       "Recipe",
@@ -1806,7 +2418,7 @@ local function export_recipe_csv(recipe, filepath)
     }
   }
 
-  local body_rows = build_csv_rows_for_recipe(recipe)
+  local body_rows = build_csv_rows_for_recipe(recipe, settings)
   for _, row in ipairs(body_rows) do
     rows[#rows + 1] = row
   end
@@ -1880,10 +2492,29 @@ end
 local function sanitize_recipe_for_export(recipe, settings)
   local copied = copy_table(recipe)
 
-  if not settings.include_file_paths then
+  if not settings.include_source_info then
     copied.project_file = ""
     for _, ingredient in ipairs(copied.ingredients) do
       ingredient.source.filepath = ""
+      ingredient.source.file_size_kb = nil
+      ingredient.source.sample_rate = nil
+      ingredient.source.bit_depth = nil
+      ingredient.source.channels = nil
+      ingredient.source.source_length = nil
+      ingredient.source.source_length_is_qn = nil
+      ingredient.source.file_exists = nil
+      ingredient.source.library_name = ""
+    end
+  elseif not settings.include_file_paths then
+    copied.project_file = ""
+    for _, ingredient in ipairs(copied.ingredients) do
+      ingredient.source.filepath = ""
+    end
+  end
+
+  if not settings.auto_detect_library then
+    for _, ingredient in ipairs(copied.ingredients) do
+      ingredient.source.library_name = ""
     end
   end
 
@@ -1895,6 +2526,12 @@ local function sanitize_recipe_for_export(recipe, settings)
       for _, fx in ipairs(ingredient.fx_chain) do
         fx.parameters = {}
       end
+    end
+  end
+
+  if not settings.include_sends then
+    for _, ingredient in ipairs(copied.ingredients) do
+      ingredient.sends = {}
     end
   end
 
@@ -1931,20 +2568,816 @@ local function export_recipe_index(recipes, output_dir)
   return write_text_file(join_paths(output_dir, "_RecipeBook_Index.md"), table.concat(lines, "\n"))
 end
 
-local function wants_markdown(output_format)
-  return output_format == "markdown" or output_format == "all"
+local function add_change(changes, change_type, label, old_value, new_value, details)
+  changes[#changes + 1] = {
+    type = change_type,
+    label = label,
+    old = old_value ~= nil and tostring(old_value) or "",
+    new = new_value ~= nil and tostring(new_value) or "",
+    details = details or "",
+  }
 end
 
-local function wants_csv(output_format)
-  return output_format == "csv" or output_format == "all"
+local function compare_parameter_sets(old_params, new_params)
+  local changes = {}
+  local old_map = {}
+  local new_map = {}
+
+  for _, param in ipairs(old_params or {}) do
+    old_map[(param.ident ~= "" and param.ident) or (param.name .. "#" .. tostring(param.index))] = param
+  end
+  for _, param in ipairs(new_params or {}) do
+    new_map[(param.ident ~= "" and param.ident) or (param.name .. "#" .. tostring(param.index))] = param
+  end
+
+  for key, old_param in pairs(old_map) do
+    local new_param = new_map[key]
+    if not new_param then
+      add_change(changes, "fx_param_removed", "FX parameter removed", old_param.name, "", "")
+    else
+      local old_display = trim_string(old_param.display ~= "" and old_param.display or tostring(old_param.normalized_value or old_param.raw_value or ""))
+      local new_display = trim_string(new_param.display ~= "" and new_param.display or tostring(new_param.normalized_value or new_param.raw_value or ""))
+      local old_value = tonumber(old_param.normalized_value or old_param.value or old_param.raw_value)
+      local new_value = tonumber(new_param.normalized_value or new_param.value or new_param.raw_value)
+      local changed = false
+
+      if old_display ~= "" or new_display ~= "" then
+        changed = old_display ~= new_display
+      elseif old_value and new_value then
+        changed = math.abs(old_value - new_value) > 0.0001
+      end
+
+      if changed then
+        add_change(changes, "fx_param_changed", old_param.name, old_display, new_display, "")
+      end
+    end
+  end
+
+  for key, new_param in pairs(new_map) do
+    if not old_map[key] then
+      local display = trim_string(new_param.display ~= "" and new_param.display or tostring(new_param.normalized_value or new_param.raw_value or ""))
+      add_change(changes, "fx_param_added", "FX parameter added", "", new_param.name .. "=" .. display, "")
+    end
+  end
+
+  table.sort(changes, function(left, right)
+    return (left.label or "") < (right.label or "")
+  end)
+
+  if #changes > 8 then
+    local trimmed = {}
+    for index = 1, 8 do
+      trimmed[index] = changes[index]
+    end
+    trimmed[#trimmed + 1] = {
+      type = "fx_param_more",
+      label = "Additional parameter changes",
+      old = "",
+      new = "",
+      details = tostring(#changes - 8) .. " more changes omitted",
+    }
+    return trimmed
+  end
+
+  return changes
 end
 
-local function wants_json(output_format)
-  return output_format == "json" or output_format == "all"
+local function compare_fx_chains(old_chain, new_chain)
+  local changes = {}
+  local max_count = math.max(#old_chain, #new_chain)
+
+  for index = 1, max_count do
+    local old_fx = old_chain[index]
+    local new_fx = new_chain[index]
+
+    if not old_fx and new_fx then
+      add_change(changes, "fx_added", "FX added", "", new_fx.name or ("FX " .. index), new_fx.summary or "")
+    elseif old_fx and not new_fx then
+      add_change(changes, "fx_removed", "FX removed", old_fx.name or ("FX " .. index), "", old_fx.summary or "")
+    elseif old_fx and new_fx then
+      if trim_string(old_fx.name) ~= trim_string(new_fx.name) then
+        add_change(changes, "fx_replaced", "FX replaced", old_fx.name, new_fx.name, "")
+      else
+        if old_fx.enabled ~= new_fx.enabled then
+          add_change(changes, "fx_enabled", "FX enabled state", tostring(old_fx.enabled), tostring(new_fx.enabled), new_fx.name)
+        end
+        if old_fx.summary ~= new_fx.summary then
+          add_change(changes, "fx_summary", "FX summary changed", old_fx.summary, new_fx.summary, new_fx.name)
+        end
+
+        local param_changes = compare_parameter_sets(old_fx.parameters or {}, new_fx.parameters or {})
+        for _, change in ipairs(param_changes) do
+          change.details = trim_string((new_fx.name or "") .. (change.details ~= "" and (" | " .. change.details) or ""))
+          changes[#changes + 1] = change
+        end
+      end
+    end
+  end
+
+  return changes
 end
 
-local function wants_file_output(output_format)
-  return output_format ~= "console"
+local function compare_sends(old_sends, new_sends)
+  local changes = {}
+  local old_map = {}
+  local new_map = {}
+
+  for _, send in ipairs(old_sends or {}) do
+    old_map[trim_string(send.dest_track_name)] = send
+  end
+  for _, send in ipairs(new_sends or {}) do
+    new_map[trim_string(send.dest_track_name)] = send
+  end
+
+  for dest_name, old_send in pairs(old_map) do
+    local new_send = new_map[dest_name]
+    if not new_send then
+      add_change(changes, "send_removed", "Send removed", dest_name, "", "")
+    else
+      if math.abs((old_send.send_volume_db or 0) - (new_send.send_volume_db or 0)) > 0.1 then
+        add_change(changes, "send_volume", "Send volume changed", format_db(old_send.send_volume_db), format_db(new_send.send_volume_db), dest_name)
+      end
+      if math.abs((old_send.send_pan or 0) - (new_send.send_pan or 0)) > 0.01 then
+        add_change(changes, "send_pan", "Send pan changed", format_pan_short(old_send.send_pan), format_pan_short(new_send.send_pan), dest_name)
+      end
+    end
+  end
+
+  for dest_name, new_send in pairs(new_map) do
+    if not old_map[dest_name] then
+      add_change(changes, "send_added", "Send added", "", dest_name, format_db(new_send.send_volume_db))
+    end
+  end
+
+  table.sort(changes, function(left, right)
+    return (left.label or "") < (right.label or "")
+  end)
+  return changes
+end
+
+local function compare_recipes(recipe_old, recipe_new)
+  local report = {
+    recipe_name = recipe_new.name or recipe_old.name or "Recipe",
+    old_name = recipe_old.name or "Old",
+    new_name = recipe_new.name or "New",
+    old_date = recipe_old.created_date or "",
+    new_date = recipe_new.created_date or "",
+    master_changes = {},
+    layer_results = {},
+    summary = {
+      changed_layers = 0,
+      added_layers = 0,
+      removed_layers = 0,
+      unchanged_layers = 0,
+      total_changes = 0,
+    },
+  }
+
+  if trim_string(recipe_old.name) ~= trim_string(recipe_new.name) then
+    add_change(report.master_changes, "recipe_name", "Recipe name changed", recipe_old.name, recipe_new.name, "")
+  end
+  if math.abs((recipe_old.master_volume_db or 0) - (recipe_new.master_volume_db or 0)) > 0.1 then
+    add_change(report.master_changes, "master_volume", "Master volume changed", format_db(recipe_old.master_volume_db), format_db(recipe_new.master_volume_db), "")
+  end
+  if math.abs((recipe_old.master_pan or 0) - (recipe_new.master_pan or 0)) > 0.01 then
+    add_change(report.master_changes, "master_pan", "Master pan changed", format_pan_short(recipe_old.master_pan), format_pan_short(recipe_new.master_pan), "")
+  end
+
+  local master_fx_changes = compare_fx_chains(recipe_old.master_fx or {}, recipe_new.master_fx or {})
+  for _, change in ipairs(master_fx_changes) do
+    report.master_changes[#report.master_changes + 1] = change
+  end
+
+  local max_layers = math.max(#(recipe_old.ingredients or {}), #(recipe_new.ingredients or {}))
+  for index = 1, max_layers do
+    local old_ing = recipe_old.ingredients and recipe_old.ingredients[index] or nil
+    local new_ing = recipe_new.ingredients and recipe_new.ingredients[index] or nil
+    local old_effective = old_ing and (
+      old_ing.effective_volume_db ~= nil and old_ing.effective_volume_db or
+      ((old_ing.take and old_ing.take.volume_db or 0) + (old_ing.track and old_ing.track.volume_db or 0))
+    ) or 0
+    local new_effective = new_ing and (
+      new_ing.effective_volume_db ~= nil and new_ing.effective_volume_db or
+      ((new_ing.take and new_ing.take.volume_db or 0) + (new_ing.track and new_ing.track.volume_db or 0))
+    ) or 0
+    local layer_result = {
+      layer = index,
+      name = (new_ing and (new_ing.layer_label or new_ing.track and new_ing.track.name)) or (old_ing and (old_ing.layer_label or old_ing.track and old_ing.track.name)) or ("Layer " .. index),
+      changes = {},
+      state = "changed",
+    }
+
+    if not old_ing and new_ing then
+      layer_result.state = "added"
+      add_change(layer_result.changes, "layer_added", "Layer added", "", layer_result.name, new_ing.source and new_ing.source.filename or "")
+      report.summary.added_layers = report.summary.added_layers + 1
+    elseif old_ing and not new_ing then
+      layer_result.state = "removed"
+      add_change(layer_result.changes, "layer_removed", "Layer removed", layer_result.name, "", old_ing.source and old_ing.source.filename or "")
+      report.summary.removed_layers = report.summary.removed_layers + 1
+    else
+      if trim_string(old_ing.source and old_ing.source.filename or "") ~= trim_string(new_ing.source and new_ing.source.filename or "") then
+        add_change(layer_result.changes, "source_changed", "Source changed", old_ing.source and old_ing.source.filename or "", new_ing.source and new_ing.source.filename or "", "")
+      end
+      if math.abs((old_ing.take and old_ing.take.pitch_cents or 0) - (new_ing.take and new_ing.take.pitch_cents or 0)) > 0.5 then
+        add_change(layer_result.changes, "pitch_changed", "Pitch changed", string.format("%+.0f cents", old_ing.take and old_ing.take.pitch_cents or 0), string.format("%+.0f cents", new_ing.take and new_ing.take.pitch_cents or 0), "")
+      end
+      if math.abs((old_ing.take and old_ing.take.playrate or 1) - (new_ing.take and new_ing.take.playrate or 1)) > 0.001 then
+        add_change(layer_result.changes, "playrate_changed", "Playrate changed", string.format("%.3fx", old_ing.take and old_ing.take.playrate or 1), string.format("%.3fx", new_ing.take and new_ing.take.playrate or 1), "")
+      end
+      if math.abs(old_effective - new_effective) > 0.1 then
+        add_change(layer_result.changes, "volume_changed", "Effective volume changed", format_db(old_effective), format_db(new_effective), "")
+      end
+      if math.abs((old_ing.track and old_ing.track.pan or 0) - (new_ing.track and new_ing.track.pan or 0)) > 0.01 then
+        add_change(layer_result.changes, "pan_changed", "Pan changed", format_pan_short(old_ing.track and old_ing.track.pan or 0), format_pan_short(new_ing.track and new_ing.track.pan or 0), "")
+      end
+      if math.abs((old_ing.item and old_ing.item.offset or 0) - (new_ing.item and new_ing.item.offset or 0)) > 0.001 then
+        add_change(layer_result.changes, "offset_changed", "Source offset changed", format_seconds(old_ing.item and old_ing.item.offset or 0), format_seconds(new_ing.item and new_ing.item.offset or 0), "")
+      end
+      if math.abs((old_ing.item and old_ing.item.length or 0) - (new_ing.item and new_ing.item.length or 0)) > 0.001 then
+        add_change(layer_result.changes, "length_changed", "Item length changed", format_seconds(old_ing.item and old_ing.item.length or 0), format_seconds(new_ing.item and new_ing.item.length or 0), "")
+      end
+
+      local fx_changes = compare_fx_chains(old_ing.fx_chain or {}, new_ing.fx_chain or {})
+      for _, change in ipairs(fx_changes) do
+        layer_result.changes[#layer_result.changes + 1] = change
+      end
+
+      local send_changes = compare_sends(old_ing.sends or {}, new_ing.sends or {})
+      for _, change in ipairs(send_changes) do
+        layer_result.changes[#layer_result.changes + 1] = change
+      end
+
+      if #layer_result.changes == 0 then
+        layer_result.state = "unchanged"
+        report.summary.unchanged_layers = report.summary.unchanged_layers + 1
+      else
+        report.summary.changed_layers = report.summary.changed_layers + 1
+      end
+    end
+
+    report.summary.total_changes = report.summary.total_changes + #layer_result.changes
+    report.layer_results[#report.layer_results + 1] = layer_result
+  end
+
+  return report
+end
+
+local function print_compare_report(report)
+  clear_console()
+  log_line(repeat_char("=", REPORT_WIDTH))
+  log_line("  Recipe Diff: " .. tostring(report.recipe_name))
+  log_line(repeat_char("=", REPORT_WIDTH))
+  log_line("  Old: " .. tostring(report.old_date) .. " -> New: " .. tostring(report.new_date))
+  log_line("")
+
+  if #report.master_changes > 0 then
+    log_line("  Master Changes:")
+    for _, change in ipairs(report.master_changes) do
+      local detail = change.details ~= "" and (" [" .. change.details .. "]") or ""
+      log_line(string.format("    - %s: %s -> %s%s", change.label, change.old, change.new, detail))
+    end
+    log_line("")
+  end
+
+  for _, layer in ipairs(report.layer_results) do
+    log_line(string.format("  Layer %d (%s):", layer.layer, layer.name))
+    if layer.state == "unchanged" then
+      log_line("    (no changes)")
+    else
+      for _, change in ipairs(layer.changes) do
+        local detail = change.details ~= "" and (" [" .. change.details .. "]") or ""
+        if change.old ~= "" or change.new ~= "" then
+          log_line(string.format("    - %s: %s -> %s%s", change.label, change.old, change.new, detail))
+        else
+          log_line(string.format("    - %s%s", change.label, detail))
+        end
+      end
+    end
+    log_line("")
+  end
+
+  log_line(repeat_char("=", REPORT_WIDTH))
+  log_line(string.format(
+    "  Summary: %d changed, %d added, %d removed, %d unchanged, %d total changes",
+    report.summary.changed_layers,
+    report.summary.added_layers,
+    report.summary.removed_layers,
+    report.summary.unchanged_layers,
+    report.summary.total_changes
+  ))
+  log_line(repeat_char("=", REPORT_WIDTH))
+end
+
+local function build_compare_csv_rows(report)
+  local rows = {
+    { "Layer", "LayerName", "ChangeType", "Label", "Old", "New", "Details" }
+  }
+
+  for _, change in ipairs(report.master_changes or {}) do
+    rows[#rows + 1] = { "Master", "Master", change.type or "", change.label or "", change.old or "", change.new or "", change.details or "" }
+  end
+
+  for _, layer in ipairs(report.layer_results or {}) do
+    if #layer.changes == 0 then
+      rows[#rows + 1] = { tostring(layer.layer), layer.name or "", "unchanged", "No changes", "", "", "" }
+    else
+      for _, change in ipairs(layer.changes) do
+        rows[#rows + 1] = {
+          tostring(layer.layer),
+          layer.name or "",
+          change.type or "",
+          change.label or "",
+          change.old or "",
+          change.new or "",
+          change.details or "",
+        }
+      end
+    end
+  end
+
+  return rows
+end
+
+local function export_compare_markdown(report, filepath)
+  local lines = {
+    "# Recipe Diff: " .. tostring(report.recipe_name),
+    "",
+    "**Old:** " .. tostring(report.old_date) .. "  ",
+    "**New:** " .. tostring(report.new_date),
+    "",
+  }
+
+  if #report.master_changes > 0 then
+    lines[#lines + 1] = "## Master Changes"
+    lines[#lines + 1] = ""
+    for _, change in ipairs(report.master_changes) do
+      local detail = change.details ~= "" and (" (" .. escape_markdown_cell(change.details) .. ")") or ""
+      lines[#lines + 1] = string.format("- **%s:** %s -> %s%s", escape_markdown_cell(change.label), escape_markdown_cell(change.old), escape_markdown_cell(change.new), detail)
+    end
+    lines[#lines + 1] = ""
+  end
+
+  for _, layer in ipairs(report.layer_results) do
+    lines[#lines + 1] = "## Layer " .. tostring(layer.layer) .. ": " .. escape_markdown_cell(layer.name or "")
+    lines[#lines + 1] = ""
+    if #layer.changes == 0 then
+      lines[#lines + 1] = "(no changes)"
+    else
+      for _, change in ipairs(layer.changes) do
+        local detail = change.details ~= "" and (" (" .. escape_markdown_cell(change.details) .. ")") or ""
+        if change.old ~= "" or change.new ~= "" then
+          lines[#lines + 1] = string.format("- **%s:** %s -> %s%s", escape_markdown_cell(change.label), escape_markdown_cell(change.old), escape_markdown_cell(change.new), detail)
+        else
+          lines[#lines + 1] = string.format("- **%s**%s", escape_markdown_cell(change.label), detail)
+        end
+      end
+    end
+    lines[#lines + 1] = ""
+  end
+
+  return write_text_file(filepath, table.concat(lines, "\n"))
+end
+
+local function export_compare_csv(report, filepath)
+  return write_csv_file(filepath, build_compare_csv_rows(report))
+end
+
+local function export_compare_json(report, filepath)
+  return write_text_file(filepath, serialize_to_json(report, 0) .. "\n")
+end
+
+local function export_compare_outputs(report, settings)
+  local written_files = {}
+  if not wants_file_output(settings) then
+    return written_files
+  end
+
+  local output_dir = resolve_output_dir(settings.output_folder)
+  if not ensure_directory(output_dir) then
+    return nil, "Could not create output folder: " .. output_dir
+  end
+
+  local base_name = sanitize_filename((report.old_name or "Old") .. "_vs_" .. (report.new_name or "New") .. "_diff")
+
+  if wants_markdown(settings) then
+    local path = join_paths(output_dir, base_name .. ".md")
+    local ok, err = export_compare_markdown(report, path)
+    if not ok then
+      return nil, err
+    end
+    append_written_file(written_files, path)
+  end
+  if wants_csv(settings) then
+    local path = join_paths(output_dir, base_name .. ".csv")
+    local ok, err = export_compare_csv(report, path)
+    if not ok then
+      return nil, err
+    end
+    append_written_file(written_files, path)
+  end
+  if wants_json(settings) then
+    local path = join_paths(output_dir, base_name .. ".json")
+    local ok, err = export_compare_json(report, path)
+    if not ok then
+      return nil, err
+    end
+    append_written_file(written_files, path)
+  end
+
+  return written_files
+end
+
+local function find_track_by_name(name)
+  local target = trim_string(name)
+  if target == "" then
+    return nil
+  end
+
+  local track_count = reaper.CountTracks(0)
+  for index = 0, track_count - 1 do
+    local track = reaper.GetTrack(0, index)
+    if trim_string(get_track_name(track)) == target then
+      return track
+    end
+  end
+
+  return nil
+end
+
+local function create_named_track_at_end(name)
+  local insert_index = reaper.CountTracks(0)
+  reaper.InsertTrackAtIndex(insert_index, true)
+  local track = reaper.GetTrack(0, insert_index)
+  reaper.GetSetMediaTrackInfo_String(track, "P_NAME", trim_string(name), true)
+  return track
+end
+
+local function add_fx_by_recipe_name(track, fx_entry)
+  local candidates = {
+    trim_string(fx_entry.name),
+    trim_string(fx_entry.short_name),
+    trim_string(strip_fx_prefix(fx_entry.name or "")),
+    trim_string((fx_entry.name or ""):gsub("%s*%b()", "")),
+  }
+
+  local seen = {}
+  for _, candidate in ipairs(candidates) do
+    if candidate ~= "" and not seen[candidate] then
+      seen[candidate] = true
+      local fx_index = reaper.TrackFX_AddByName(track, candidate, false, -1)
+      if fx_index >= 0 then
+        return fx_index, candidate
+      end
+    end
+  end
+
+  return -1, ""
+end
+
+local function restore_fx_chain_to_track(track, fx_chain, summary)
+  for _, fx_entry in ipairs(fx_chain or {}) do
+    local fx_index = add_fx_by_recipe_name(track, fx_entry)
+    if fx_index and fx_index >= 0 then
+      if fx_entry.parameters then
+        for _, parameter in ipairs(fx_entry.parameters) do
+          local normalized = tonumber(parameter.normalized_value or parameter.value)
+          if normalized ~= nil then
+            reaper.TrackFX_SetParamNormalized(track, fx_index, parameter.index or 0, normalized)
+          elseif parameter.raw_value ~= nil then
+            reaper.TrackFX_SetParam(track, fx_index, parameter.index or 0, tonumber(parameter.raw_value) or 0)
+          end
+        end
+      end
+
+      local wet_param_index = tonumber(reaper.TrackFX_GetParamFromIdent(track, fx_index, ":wet")) or -1
+      if wet_param_index >= 0 and fx_entry.wet_dry ~= nil then
+        reaper.TrackFX_SetParamNormalized(track, fx_index, wet_param_index, tonumber(fx_entry.wet_dry) or 1.0)
+      end
+
+      if fx_entry.enabled ~= nil then
+        reaper.TrackFX_SetEnabled(track, fx_index, fx_entry.enabled)
+      end
+      if fx_entry.offline ~= nil then
+        reaper.TrackFX_SetOffline(track, fx_index, fx_entry.offline)
+      end
+
+      summary.restored_fx = (summary.restored_fx or 0) + 1
+    else
+      summary.skipped_fx = (summary.skipped_fx or 0) + 1
+      summary.warnings[#summary.warnings + 1] = "Could not load FX: " .. tostring(fx_entry.name)
+    end
+  end
+end
+
+local function apply_track_state(track, track_state)
+  if not track or type(track_state) ~= "table" then
+    return
+  end
+
+  if trim_string(track_state.name) ~= "" then
+    reaper.GetSetMediaTrackInfo_String(track, "P_NAME", trim_string(track_state.name), true)
+  end
+  if track_state.volume_db ~= nil then
+    reaper.SetMediaTrackInfo_Value(track, "D_VOL", db_to_linear(track_state.volume_db))
+  end
+  if track_state.pan ~= nil then
+    reaper.SetMediaTrackInfo_Value(track, "D_PAN", tonumber(track_state.pan) or 0)
+  end
+  if track_state.mute ~= nil then
+    reaper.SetMediaTrackInfo_Value(track, "B_MUTE", track_state.mute and 1 or 0)
+  end
+  if track_state.phase_invert ~= nil then
+    reaper.SetMediaTrackInfo_Value(track, "B_PHASE", track_state.phase_invert and 1 or 0)
+  end
+  if track_state.color and track_state.color ~= "" then
+    local native = hex_to_native_color(track_state.color)
+    if native then
+      reaper.SetMediaTrackInfo_Value(track, "I_CUSTOMCOLOR", native)
+    end
+  end
+end
+
+local function rebuild_from_recipe(recipe, options)
+  options = options or {}
+  local summary = {
+    recipe_name = recipe.name or "Recipe",
+    created_tracks = 0,
+    created_items = 0,
+    created_send_tracks = 0,
+    restored_sends = 0,
+    restored_fx = 0,
+    skipped_fx = 0,
+    missing_sources = {},
+    warnings = {},
+  }
+
+  local layer_tracks = {}
+  local send_target_tracks = {}
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+
+  local ok, error_message = xpcall(function()
+    local insert_index = reaper.CountTracks(0)
+    reaper.InsertTrackAtIndex(insert_index, true)
+    local folder_track = reaper.GetTrack(0, insert_index)
+    summary.created_tracks = summary.created_tracks + 1
+
+    apply_track_state(folder_track, recipe.master_track or { name = recipe.name, volume_db = recipe.master_volume_db, pan = recipe.master_pan })
+    reaper.SetMediaTrackInfo_Value(folder_track, "I_FOLDERDEPTH", #(recipe.ingredients or {}) > 0 and 1 or 0)
+
+    for index, ingredient in ipairs(recipe.ingredients or {}) do
+      local track_index = insert_index + index
+      reaper.InsertTrackAtIndex(track_index, true)
+      local layer_track = reaper.GetTrack(0, track_index)
+      layer_tracks[index] = layer_track
+      summary.created_tracks = summary.created_tracks + 1
+
+      apply_track_state(layer_track, ingredient.track or { name = ingredient.layer_label })
+      reaper.SetMediaTrackInfo_Value(layer_track, "I_FOLDERDEPTH", index == #(recipe.ingredients or {}) and -1 or 0)
+
+      if ingredient.source and ingredient.source.filepath ~= "" then
+        local source_path = resolve_existing_file_path(ingredient.source.filepath)
+        if reaper.file_exists(source_path) then
+          local item = reaper.AddMediaItemToTrack(layer_track)
+          summary.created_items = summary.created_items + 1
+          reaper.SetMediaItemInfo_Value(item, "D_POSITION", tonumber(ingredient.item and ingredient.item.position) or 0)
+          reaper.SetMediaItemInfo_Value(item, "D_LENGTH", tonumber(ingredient.item and ingredient.item.length) or 1.0)
+          reaper.SetMediaItemInfo_Value(item, "D_FADEINLEN", tonumber(ingredient.item and ingredient.item.fade_in_length) or 0)
+          reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", tonumber(ingredient.item and ingredient.item.fade_out_length) or 0)
+          reaper.SetMediaItemInfo_Value(item, "C_FADEINSHAPE", tonumber(ingredient.item and ingredient.item.fade_in_shape_index) or 0)
+          reaper.SetMediaItemInfo_Value(item, "C_FADEOUTSHAPE", tonumber(ingredient.item and ingredient.item.fade_out_shape_index) or 0)
+          reaper.SetMediaItemInfo_Value(item, "D_FADEINDIR", tonumber(ingredient.item and ingredient.item.fade_in_curve) or 0)
+          reaper.SetMediaItemInfo_Value(item, "D_FADEOUTDIR", tonumber(ingredient.item and ingredient.item.fade_out_curve) or 0)
+
+          local take = reaper.AddTakeToMediaItem(item)
+          local pcm_source = reaper.PCM_Source_CreateFromFile(source_path)
+          if pcm_source then
+            reaper.SetMediaItemTake_Source(take, pcm_source)
+          end
+
+          if ingredient.take then
+            reaper.SetMediaItemTakeInfo_Value(take, "D_PITCH", tonumber(ingredient.take.pitch_semitones) or 0)
+            reaper.SetMediaItemTakeInfo_Value(take, "D_PLAYRATE", tonumber(ingredient.take.playrate) or 1)
+            reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", tonumber(ingredient.take.volume_linear) or db_to_linear(ingredient.take.volume_db or 0))
+            reaper.SetMediaItemTakeInfo_Value(take, "D_STARTOFFS", tonumber(ingredient.take.offset or ingredient.item and ingredient.item.offset) or 0)
+            reaper.SetMediaItemTakeInfo_Value(take, "B_PPITCH", ingredient.take.preserve_pitch == false and 0 or 1)
+            if ingredient.take.pitch_mode_raw ~= nil then
+              reaper.SetMediaItemTakeInfo_Value(take, "I_PITCHMODE", tonumber(ingredient.take.pitch_mode_raw) or -1)
+            end
+            if trim_string(ingredient.take.name) ~= "" then
+              reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", ingredient.take.name, true)
+            end
+          end
+
+          reaper.UpdateItemInProject(item)
+        else
+          summary.missing_sources[#summary.missing_sources + 1] = source_path
+        end
+      end
+
+      if options.restore_fx then
+        restore_fx_chain_to_track(layer_track, ingredient.fx_chain or {}, summary)
+      end
+    end
+
+    if options.restore_master_fx then
+      restore_fx_chain_to_track(folder_track, recipe.master_fx or {}, summary)
+    end
+
+    if options.restore_sends then
+      for index, ingredient in ipairs(recipe.ingredients or {}) do
+        local source_track = layer_tracks[index]
+        for _, send in ipairs(ingredient.sends or {}) do
+          local dest_name = trim_string(send.dest_track_name)
+          if dest_name ~= "" then
+            local dest_track = send_target_tracks[dest_name] or find_track_by_name(dest_name)
+            if not dest_track and options.create_missing_send_tracks then
+              dest_track = create_named_track_at_end(dest_name)
+              send_target_tracks[dest_name] = dest_track
+              summary.created_tracks = summary.created_tracks + 1
+              summary.created_send_tracks = summary.created_send_tracks + 1
+            end
+
+            if dest_track then
+              local send_index = reaper.CreateTrackSend(source_track, dest_track)
+              if send_index >= 0 then
+                reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "D_VOL", db_to_linear(send.send_volume_db or 0))
+                reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "D_PAN", tonumber(send.send_pan) or 0)
+                if send.mute ~= nil then
+                  reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "B_MUTE", send.mute and 1 or 0)
+                end
+                if send.phase_invert ~= nil then
+                  reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "B_PHASE", send.phase_invert and 1 or 0)
+                end
+                summary.restored_sends = summary.restored_sends + 1
+              end
+            else
+              summary.warnings[#summary.warnings + 1] = "Send target not found: " .. dest_name
+            end
+          end
+        end
+      end
+    end
+  end, function(message)
+    return debug.traceback(message, 2)
+  end)
+
+  reaper.PreventUIRefresh(-1)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.UpdateArrange()
+
+  if ok then
+    reaper.Undo_EndBlock("Rebuild Recipe: " .. tostring(summary.recipe_name), -1)
+    return true, summary
+  end
+
+  reaper.Undo_EndBlock("Rebuild Recipe Failed", -1)
+  return false, error_message
+end
+
+local function print_rebuild_report(summary)
+  clear_console()
+  log_line(repeat_char("=", REPORT_WIDTH))
+  log_line("  Recipe Rebuild: " .. tostring(summary.recipe_name))
+  log_line(repeat_char("=", REPORT_WIDTH))
+  log_line("  Tracks Created:      " .. tostring(summary.created_tracks))
+  log_line("  Items Created:       " .. tostring(summary.created_items))
+  log_line("  FX Restored:         " .. tostring(summary.restored_fx or 0))
+  log_line("  FX Skipped:          " .. tostring(summary.skipped_fx or 0))
+  log_line("  Sends Restored:      " .. tostring(summary.restored_sends or 0))
+  log_line("  Send Tracks Created: " .. tostring(summary.created_send_tracks or 0))
+  log_line("  Missing Sources:     " .. tostring(#(summary.missing_sources or {})))
+  if #(summary.missing_sources or {}) > 0 then
+    log_line("")
+    for _, path in ipairs(summary.missing_sources) do
+      log_line("  Missing: " .. tostring(path))
+    end
+  end
+  if #(summary.warnings or {}) > 0 then
+    log_line("")
+    for _, warning in ipairs(summary.warnings) do
+      log_line("  Warning: " .. tostring(warning))
+    end
+  end
+  log_line(repeat_char("=", REPORT_WIDTH))
+end
+
+local function export_rebuild_markdown(summary, filepath)
+  local lines = {
+    "# Recipe Rebuild: " .. tostring(summary.recipe_name),
+    "",
+    "| Field | Value |",
+    "|-------|-------|",
+    "| Tracks Created | " .. tostring(summary.created_tracks) .. " |",
+    "| Items Created | " .. tostring(summary.created_items) .. " |",
+    "| FX Restored | " .. tostring(summary.restored_fx or 0) .. " |",
+    "| FX Skipped | " .. tostring(summary.skipped_fx or 0) .. " |",
+    "| Sends Restored | " .. tostring(summary.restored_sends or 0) .. " |",
+    "| Send Tracks Created | " .. tostring(summary.created_send_tracks or 0) .. " |",
+    "| Missing Sources | " .. tostring(#(summary.missing_sources or {})) .. " |",
+    "",
+  }
+
+  if #(summary.missing_sources or {}) > 0 then
+    lines[#lines + 1] = "## Missing Sources"
+    lines[#lines + 1] = ""
+    for _, path in ipairs(summary.missing_sources) do
+      lines[#lines + 1] = "- `" .. escape_inline_code(path) .. "`"
+    end
+    lines[#lines + 1] = ""
+  end
+
+  if #(summary.warnings or {}) > 0 then
+    lines[#lines + 1] = "## Warnings"
+    lines[#lines + 1] = ""
+    for _, warning in ipairs(summary.warnings) do
+      lines[#lines + 1] = "- " .. escape_markdown_cell(warning)
+    end
+    lines[#lines + 1] = ""
+  end
+
+  return write_text_file(filepath, table.concat(lines, "\n"))
+end
+
+local function export_rebuild_csv(summary, filepath)
+  local rows = {
+    { "Recipe", "TracksCreated", "ItemsCreated", "FXRestored", "FXSkipped", "SendsRestored", "SendTracksCreated", "MissingSources", "Warnings" },
+    {
+      summary.recipe_name or "",
+      tostring(summary.created_tracks or 0),
+      tostring(summary.created_items or 0),
+      tostring(summary.restored_fx or 0),
+      tostring(summary.skipped_fx or 0),
+      tostring(summary.restored_sends or 0),
+      tostring(summary.created_send_tracks or 0),
+      table.concat(summary.missing_sources or {}, "; "),
+      table.concat(summary.warnings or {}, "; "),
+    }
+  }
+  return write_csv_file(filepath, rows)
+end
+
+local function export_rebuild_json(summary, filepath)
+  return write_text_file(filepath, serialize_to_json(summary, 0) .. "\n")
+end
+
+local function export_rebuild_outputs(summary, settings)
+  local written_files = {}
+  if not wants_file_output(settings) then
+    return written_files
+  end
+
+  local output_dir = resolve_output_dir(settings.output_folder)
+  if not ensure_directory(output_dir) then
+    return nil, "Could not create output folder: " .. output_dir
+  end
+
+  local base_name = sanitize_filename((summary.recipe_name or "Recipe") .. "_rebuild_report")
+
+  if wants_markdown(settings) then
+    local path = join_paths(output_dir, base_name .. ".md")
+    local ok, err = export_rebuild_markdown(summary, path)
+    if not ok then
+      return nil, err
+    end
+    append_written_file(written_files, path)
+  end
+  if wants_csv(settings) then
+    local path = join_paths(output_dir, base_name .. ".csv")
+    local ok, err = export_rebuild_csv(summary, path)
+    if not ok then
+      return nil, err
+    end
+    append_written_file(written_files, path)
+  end
+  if wants_json(settings) then
+    local path = join_paths(output_dir, base_name .. ".json")
+    local ok, err = export_rebuild_json(summary, path)
+    if not ok then
+      return nil, err
+    end
+    append_written_file(written_files, path)
+  end
+
+  return written_files
+end
+
+local function wants_markdown(settings)
+  return settings.export_markdown == true
+end
+
+local function wants_csv(settings)
+  return settings.export_csv == true
+end
+
+local function wants_json(settings)
+  return settings.export_json == true
+end
+
+local function wants_file_output(settings)
+  return settings.export_markdown or settings.export_csv or settings.export_json
 end
 
 local function append_written_file(written_files, path)
@@ -1954,7 +3387,7 @@ end
 local function export_recipes(recipes, settings)
   local written_files = {}
 
-  if not wants_file_output(settings.output_format) then
+  if not wants_file_output(settings) then
     return written_files
   end
 
@@ -1967,7 +3400,7 @@ local function export_recipes(recipes, settings)
     local recipe = recipes[1]
     local safe_name = sanitize_filename(recipe.name)
 
-    if wants_markdown(settings.output_format) then
+    if wants_markdown(settings) then
       local path = join_paths(output_dir, safe_name .. ".md")
       local ok, error_message = export_recipe_markdown(recipe, path, settings)
       if not ok then
@@ -1976,16 +3409,16 @@ local function export_recipes(recipes, settings)
       append_written_file(written_files, path)
     end
 
-    if wants_csv(settings.output_format) then
+    if wants_csv(settings) then
       local path = join_paths(output_dir, safe_name .. ".csv")
-      local ok, error_message = export_recipe_csv(recipe, path)
+      local ok, error_message = export_recipe_csv(recipe, path, settings)
       if not ok then
         return nil, "CSV export failed: " .. tostring(error_message)
       end
       append_written_file(written_files, path)
     end
 
-    if wants_json(settings.output_format) then
+    if wants_json(settings) then
       local path = join_paths(output_dir, safe_name .. ".json")
       local ok, error_message = export_recipe_json(recipe, path, settings)
       if not ok then
@@ -1997,7 +3430,7 @@ local function export_recipes(recipes, settings)
     return written_files
   end
 
-  if wants_markdown(settings.output_format) then
+  if wants_markdown(settings) then
     for _, recipe in ipairs(recipes) do
       local path = join_paths(output_dir, sanitize_filename(recipe.name) .. ".md")
       local ok, error_message = export_recipe_markdown(recipe, path, settings)
@@ -2014,7 +3447,7 @@ local function export_recipes(recipes, settings)
     append_written_file(written_files, join_paths(output_dir, "_RecipeBook_Index.md"))
   end
 
-  if wants_csv(settings.output_format) then
+  if wants_csv(settings) then
     local rows = {
       {
         "Recipe",
@@ -2037,7 +3470,7 @@ local function export_recipes(recipes, settings)
     }
 
     for _, recipe in ipairs(recipes) do
-      local recipe_rows = build_csv_rows_for_recipe(recipe)
+      local recipe_rows = build_csv_rows_for_recipe(recipe, settings)
       for _, row in ipairs(recipe_rows) do
         rows[#rows + 1] = row
       end
@@ -2051,7 +3484,7 @@ local function export_recipes(recipes, settings)
     append_written_file(written_files, csv_path)
   end
 
-  if wants_json(settings.output_format) then
+  if wants_json(settings) then
     local json_path = join_paths(output_dir, "recipes_all.json")
     local payload = {}
     for _, recipe in ipairs(recipes) do
@@ -2081,13 +3514,36 @@ local function load_settings()
   end
 
   settings.mode = parse_mode(settings.mode, DEFAULTS.mode)
+  settings.source_scope = parse_source_scope(settings.source_scope, DEFAULTS.source_scope)
   settings.output_format = parse_output_format(settings.output_format, DEFAULTS.output_format)
   settings.prefix_filter = trim_string(settings.prefix_filter)
   settings.output_folder = trim_string(settings.output_folder)
+  settings.rebuild_json_path = trim_string(settings.rebuild_json_path)
+  settings.compare_old_json_path = trim_string(settings.compare_old_json_path)
+  settings.compare_new_json_path = trim_string(settings.compare_new_json_path)
+  settings.custom_library_patterns = tostring(settings.custom_library_patterns or "")
+
+  local has_export_flags =
+    reaper.GetExtState(EXT_SECTION, "export_console") ~= "" or
+    reaper.GetExtState(EXT_SECTION, "export_markdown") ~= "" or
+    reaper.GetExtState(EXT_SECTION, "export_csv") ~= "" or
+    reaper.GetExtState(EXT_SECTION, "export_json") ~= ""
+
+  if not has_export_flags then
+    apply_export_flags_from_output_format(settings)
+  else
+    settings.output_format = derive_output_format_from_flags(settings)
+  end
+
+  refresh_custom_library_patterns(settings.custom_library_patterns)
+
   return settings
 end
 
 local function save_settings(settings)
+  settings.output_format = derive_output_format_from_flags(settings)
+  settings.custom_library_patterns = tostring(settings.custom_library_patterns or serialize_custom_library_patterns(CUSTOM_LIBRARY_PATTERNS))
+  refresh_custom_library_patterns(settings.custom_library_patterns)
   for key, value in pairs(settings) do
     local encoded = value
     if type(value) == "boolean" then
@@ -2145,21 +3601,37 @@ local function prompt_for_settings(current)
     return nil, "Unsupported output format."
   end
 
+  settings.source_scope = settings.mode == "batch" and "all_folder_tracks" or current.source_scope or DEFAULTS.source_scope
+  apply_export_flags_from_output_format(settings)
+  settings.include_source_info = current.include_source_info
+  settings.verbose_fx_parameters = current.verbose_fx_parameters
+  settings.include_sends = current.include_sends
+  settings.auto_detect_library = current.auto_detect_library
+  settings.auto_tag_keywords = current.auto_tag_keywords
+
+  if not has_any_output_enabled(settings) then
+    return nil, "Select at least one output format."
+  end
+
   return settings
 end
 
 local function apply_optional_notes(recipe, settings)
-  if not settings.add_notes_prompt then
-    return recipe
+  local tags = recipe.tags or {}
+  if settings.auto_tag_keywords then
+    tags = merge_tags(tags, build_auto_tags(recipe.name))
   end
 
-  local notes, tags, difficulty = prompt_recipe_notes(recipe.name)
-  if notes ~= nil then
-    recipe.notes = notes
-    recipe.tags = tags or {}
-    recipe.difficulty = difficulty
+  if settings.add_notes_prompt then
+    local notes, entered_tags, difficulty = prompt_recipe_notes(recipe.name)
+    if notes ~= nil then
+      recipe.notes = notes
+      tags = merge_tags(tags, entered_tags or {})
+      recipe.difficulty = difficulty
+    end
   end
 
+  recipe.tags = tags
   return recipe
 end
 
@@ -2175,15 +3647,76 @@ local function summarize_written_files(written_files)
   return table.concat(lines, "\n")
 end
 
+local function prompt_compare_settings(settings)
+  local old_path, old_error = prompt_json_file(
+    "Select OLD recipe JSON",
+    settings.compare_old_json_path or settings.output_folder or ""
+  )
+  if not old_path then
+    return nil, old_error
+  end
+
+  local new_path, new_error = prompt_json_file(
+    "Select NEW recipe JSON",
+    settings.compare_new_json_path or old_path
+  )
+  if not new_path then
+    return nil, new_error
+  end
+
+  settings.compare_old_json_path = old_path
+  settings.compare_new_json_path = new_path
+  save_settings(settings)
+  return settings
+end
+
+local function prompt_rebuild_settings(settings)
+  local json_path, path_error = prompt_json_file(
+    "Select recipe JSON to rebuild",
+    settings.rebuild_json_path or settings.output_folder or ""
+  )
+  if not json_path then
+    return nil, path_error
+  end
+
+  local options, options_error = prompt_yes_no_options(
+    SCRIPT_TITLE .. " - Rebuild Options",
+    {
+      { key = "rebuild_restore_fx", label = "Restore Layer FX (yes/no)", value = settings.rebuild_restore_fx ~= false },
+      { key = "rebuild_restore_master_fx", label = "Restore Folder FX (yes/no)", value = settings.rebuild_restore_master_fx ~= false },
+      { key = "rebuild_restore_sends", label = "Restore Sends (yes/no)", value = settings.rebuild_restore_sends ~= false },
+      { key = "rebuild_create_missing_send_tracks", label = "Create Missing Send Tracks (yes/no)", value = settings.rebuild_create_missing_send_tracks ~= false },
+    }
+  )
+  if not options then
+    return nil, options_error
+  end
+
+  settings.rebuild_json_path = json_path
+  settings.rebuild_restore_fx = options.rebuild_restore_fx
+  settings.rebuild_restore_master_fx = options.rebuild_restore_master_fx
+  settings.rebuild_restore_sends = options.rebuild_restore_sends
+  settings.rebuild_create_missing_send_tracks = options.rebuild_create_missing_send_tracks
+  save_settings(settings)
+  return settings
+end
+
 local function run_single(settings)
+  if not has_any_output_enabled(settings) then
+    return false, "Select at least one output format."
+  end
+
   local folder_track = find_selected_recipe_folder()
   if not folder_track then
     return false, "Select a folder track, or a media item inside a recipe folder, then run the script again."
   end
 
+  clear_console()
   local recipe = crawl_recipe(folder_track)
   apply_optional_notes(recipe, settings)
-  print_recipe_report(recipe, settings)
+  if settings.export_console then
+    print_recipe_report(recipe, settings)
+  end
 
   local written_files, export_error = export_recipes({ recipe }, settings)
   if not written_files then
@@ -2194,15 +3727,22 @@ local function run_single(settings)
 end
 
 local function run_batch(settings)
+  if not has_any_output_enabled(settings) then
+    return false, "Select at least one output format."
+  end
+
   local recipes = batch_crawl_all_recipes(settings)
   if #recipes == 0 then
     local filter_text = settings.prefix_filter ~= "" and (" with prefix '" .. settings.prefix_filter .. "'") or ""
     return false, "No top-level folder recipes were found" .. filter_text .. "."
   end
 
+  clear_console()
   for _, recipe in ipairs(recipes) do
     apply_optional_notes(recipe, settings)
-    print_recipe_report(recipe, settings)
+    if settings.export_console then
+      print_recipe_report(recipe, settings)
+    end
   end
 
   local written_files, export_error = export_recipes(recipes, settings)
@@ -2213,7 +3753,89 @@ local function run_batch(settings)
   return true, string.format("Crawled %d recipes.\n\n%s", #recipes, summarize_written_files(written_files))
 end
 
+local function run_compare(settings)
+  if not has_any_output_enabled(settings) then
+    return false, "Select at least one output format."
+  end
+
+  local prepared_settings, settings_error = prompt_compare_settings(settings)
+  if not prepared_settings then
+    return false, settings_error
+  end
+
+  local recipe_old, old_error = load_recipe_from_json_path(
+    prepared_settings.compare_old_json_path,
+    SCRIPT_TITLE .. " - Select OLD Recipe"
+  )
+  if not recipe_old then
+    return false, old_error
+  end
+
+  local recipe_new, new_error = load_recipe_from_json_path(
+    prepared_settings.compare_new_json_path,
+    SCRIPT_TITLE .. " - Select NEW Recipe"
+  )
+  if not recipe_new then
+    return false, new_error
+  end
+
+  local report = compare_recipes(recipe_old, recipe_new)
+  if prepared_settings.export_console then
+    print_compare_report(report)
+  end
+
+  local written_files, export_error = export_compare_outputs(report, prepared_settings)
+  if not written_files then
+    return false, export_error
+  end
+
+  return true, "Recipe diff completed: " .. tostring(report.recipe_name) .. "\n\n" .. summarize_written_files(written_files)
+end
+
+local function run_rebuild(settings)
+  if not has_any_output_enabled(settings) then
+    return false, "Select at least one output format."
+  end
+
+  local prepared_settings, settings_error = prompt_rebuild_settings(settings)
+  if not prepared_settings then
+    return false, settings_error
+  end
+
+  local recipe, recipe_error = load_recipe_from_json_path(
+    prepared_settings.rebuild_json_path,
+    SCRIPT_TITLE .. " - Select Recipe To Rebuild"
+  )
+  if not recipe then
+    return false, recipe_error
+  end
+
+  local rebuild_ok, rebuild_result = rebuild_from_recipe(recipe, {
+    restore_fx = prepared_settings.rebuild_restore_fx ~= false,
+    restore_master_fx = prepared_settings.rebuild_restore_master_fx ~= false,
+    restore_sends = prepared_settings.rebuild_restore_sends ~= false,
+    create_missing_send_tracks = prepared_settings.rebuild_create_missing_send_tracks ~= false,
+  })
+  if not rebuild_ok then
+    return false, rebuild_result
+  end
+
+  if prepared_settings.export_console then
+    print_rebuild_report(rebuild_result)
+  end
+
+  local written_files, export_error = export_rebuild_outputs(rebuild_result, prepared_settings)
+  if not written_files then
+    return false, export_error
+  end
+
+  return true, "Recipe rebuilt: " .. tostring(rebuild_result.recipe_name) .. "\n\n" .. summarize_written_files(written_files)
+end
+
 local function run_mode(settings)
+  if settings.mode == "single" and settings.source_scope == "all_folder_tracks" then
+    return run_batch(settings)
+  end
   if settings.mode == "single" then
     return run_single(settings)
   end
@@ -2221,17 +3843,104 @@ local function run_mode(settings)
     return run_batch(settings)
   end
   if settings.mode == "rebuild" then
-    return false, "Rebuild mode is planned for a later phase. This build implements crawl and export only."
+    return run_rebuild(settings)
   end
   if settings.mode == "compare" then
-    return false, "Compare mode is planned for a later phase. This build implements crawl and export only."
+    return run_compare(settings)
   end
   return false, "Unsupported mode: " .. tostring(settings.mode)
 end
 
-local function main()
-  clear_console()
-  local current_settings = load_settings()
+local UI_MODE_LABELS = {
+  single = "Single Recipe",
+  batch = "Batch All",
+  rebuild = "Rebuild",
+  compare = "Compare",
+}
+
+local function get_mode_label(mode)
+  return UI_MODE_LABELS[mode] or tostring(mode or "")
+end
+
+local function get_scope_label(scope)
+  if scope == "all_folder_tracks" then
+    return "All folder tracks"
+  end
+  return "Selected folder track"
+end
+
+local function build_settings_from_ui(ui)
+  local settings = {
+    mode = ui.mode,
+    source_scope = ui.source_scope,
+    output_folder = trim_string(ui.output_folder),
+    export_console = ui.export_console,
+    export_markdown = ui.export_markdown,
+    export_csv = ui.export_csv,
+    export_json = ui.export_json,
+    include_source_info = ui.include_source_info,
+    include_fx_parameters = ui.include_fx_parameters,
+    verbose_fx_parameters = ui.verbose_fx_parameters,
+    include_file_paths = ui.include_file_paths,
+    include_sends = ui.include_sends,
+    add_notes_prompt = ui.add_notes_prompt,
+    auto_detect_library = ui.auto_detect_library,
+    auto_tag_keywords = ui.auto_tag_keywords,
+    prefix_filter = trim_string(ui.prefix_filter),
+    rebuild_json_path = trim_string(ui.rebuild_json_path),
+    compare_old_json_path = trim_string(ui.compare_old_json_path),
+    compare_new_json_path = trim_string(ui.compare_new_json_path),
+    rebuild_restore_fx = ui.rebuild_restore_fx ~= false,
+    rebuild_restore_master_fx = ui.rebuild_restore_master_fx ~= false,
+    rebuild_restore_sends = ui.rebuild_restore_sends ~= false,
+    rebuild_create_missing_send_tracks = ui.rebuild_create_missing_send_tracks ~= false,
+    custom_library_patterns = tostring(ui.custom_library_patterns or ""),
+  }
+
+  if settings.mode == "batch" then
+    settings.source_scope = "all_folder_tracks"
+  end
+
+  settings.output_format = derive_output_format_from_flags(settings)
+  return settings
+end
+
+local function save_ui_settings(ui)
+  save_settings(build_settings_from_ui(ui))
+end
+
+local function apply_settings_to_ui(ui, settings)
+  if not ui or not settings then
+    return
+  end
+
+  ui.mode = settings.mode or ui.mode
+  ui.source_scope = settings.source_scope or ui.source_scope
+  ui.output_folder = settings.output_folder or ui.output_folder
+  ui.export_console = settings.export_console ~= false
+  ui.export_markdown = settings.export_markdown == true
+  ui.export_csv = settings.export_csv == true
+  ui.export_json = settings.export_json == true
+  ui.include_source_info = settings.include_source_info ~= false
+  ui.include_fx_parameters = settings.include_fx_parameters ~= false
+  ui.verbose_fx_parameters = settings.verbose_fx_parameters == true
+  ui.include_file_paths = settings.include_file_paths ~= false
+  ui.include_sends = settings.include_sends ~= false
+  ui.add_notes_prompt = settings.add_notes_prompt ~= false
+  ui.auto_detect_library = settings.auto_detect_library ~= false
+  ui.auto_tag_keywords = settings.auto_tag_keywords == true
+  ui.prefix_filter = settings.prefix_filter or ui.prefix_filter
+  ui.rebuild_json_path = settings.rebuild_json_path or ui.rebuild_json_path
+  ui.compare_old_json_path = settings.compare_old_json_path or ui.compare_old_json_path
+  ui.compare_new_json_path = settings.compare_new_json_path or ui.compare_new_json_path
+  ui.rebuild_restore_fx = settings.rebuild_restore_fx ~= false
+  ui.rebuild_restore_master_fx = settings.rebuild_restore_master_fx ~= false
+  ui.rebuild_restore_sends = settings.rebuild_restore_sends ~= false
+  ui.rebuild_create_missing_send_tracks = settings.rebuild_create_missing_send_tracks ~= false
+  ui.custom_library_patterns = settings.custom_library_patterns or ui.custom_library_patterns
+end
+
+local function run_prompt_flow(current_settings)
   local settings, prompt_error = prompt_for_settings(current_settings)
 
   if not settings then
@@ -2255,12 +3964,641 @@ local function main()
   end
 
   if not run_ok then
-    show_error(result_message)
+    if result_message and result_message ~= "User cancelled." then
+      show_error(result_message)
+    end
     return
   end
 
   if result_message and result_message ~= "" then
     reaper.ShowMessageBox(result_message, SCRIPT_TITLE, 0)
+  end
+end
+
+local function set_status(ui, message)
+  ui.status_message = tostring(message or "")
+end
+
+local function point_in_rect(x, y, rect_x, rect_y, rect_w, rect_h)
+  return x >= rect_x and x <= rect_x + rect_w and y >= rect_y and y <= rect_y + rect_h
+end
+
+local function set_gfx_color(r, g, b, a)
+  gfx.set((r or 0) / 255, (g or 0) / 255, (b or 0) / 255, (a or 255) / 255)
+end
+
+local function draw_rect(rect_x, rect_y, rect_w, rect_h, fill, r, g, b, a)
+  set_gfx_color(r, g, b, a)
+  gfx.rect(rect_x, rect_y, rect_w, rect_h, fill and 1 or 0)
+end
+
+local function draw_text(text, x, y, r, g, b, a, font_index, font_name, font_size)
+  gfx.setfont(font_index or 1, font_name or "Segoe UI", font_size or 16)
+  set_gfx_color(r, g, b, a)
+  gfx.x = x
+  gfx.y = y
+  gfx.drawstr(tostring(text or ""))
+end
+
+local function shorten_text(value, max_length)
+  local text = tostring(value or "")
+  if #text <= max_length then
+    return text
+  end
+  if max_length <= 3 then
+    return text:sub(1, max_length)
+  end
+  return text:sub(1, max_length - 3) .. "..."
+end
+
+local function draw_button(ui, id, label, rect_x, rect_y, rect_w, rect_h, enabled)
+  local is_enabled = enabled ~= false
+  local hovered = is_enabled and point_in_rect(ui.mouse_x, ui.mouse_y, rect_x, rect_y, rect_w, rect_h)
+
+  if hovered and ui.mouse_pressed then
+    ui.active_mouse_id = id
+    ui.focus_field = nil
+  end
+
+  local clicked = is_enabled and hovered and ui.mouse_released and ui.active_mouse_id == id
+  local fill = is_enabled and (hovered and 74 or 56) or 34
+  local border = is_enabled and (hovered and 132 or 92) or 55
+
+  draw_rect(rect_x, rect_y, rect_w, rect_h, true, fill, fill, fill + 4, 255)
+  draw_rect(rect_x, rect_y, rect_w, rect_h, false, border, border, border, 255)
+  draw_text(label, rect_x + 10, rect_y + 8, is_enabled and 240 or 120, is_enabled and 240 or 120, is_enabled and 240 or 120, 255, 1, "Segoe UI", 15)
+
+  return clicked
+end
+
+local function draw_checkbox(ui, id, label, rect_x, rect_y, value)
+  local box_size = 18
+  local hovered = point_in_rect(ui.mouse_x, ui.mouse_y, rect_x, rect_y, box_size + 8 + 260, box_size)
+  if hovered and ui.mouse_pressed then
+    ui.active_mouse_id = id
+    ui.focus_field = nil
+  end
+  local changed = hovered and ui.mouse_released and ui.active_mouse_id == id
+
+  draw_rect(rect_x, rect_y, box_size, box_size, true, 35, 35, 35, 255)
+  draw_rect(rect_x, rect_y, box_size, box_size, false, 100, 100, 100, 255)
+  if value then
+    draw_rect(rect_x + 4, rect_y + 4, box_size - 8, box_size - 8, true, 110, 190, 120, 255)
+  end
+  draw_text(label, rect_x + box_size + 8, rect_y - 1, 225, 225, 225, 255, 1, "Segoe UI", 15)
+
+  return changed and not value or value
+end
+
+local function draw_radio(ui, id, label, rect_x, rect_y, value, target_value)
+  local radius = 18
+  local hovered = point_in_rect(ui.mouse_x, ui.mouse_y, rect_x, rect_y, radius + 8 + 260, radius)
+  if hovered and ui.mouse_pressed then
+    ui.active_mouse_id = id
+    ui.focus_field = nil
+  end
+  local changed = hovered and ui.mouse_released and ui.active_mouse_id == id
+
+  draw_rect(rect_x, rect_y, radius, radius, true, 35, 35, 35, 255)
+  draw_rect(rect_x, rect_y, radius, radius, false, 100, 100, 100, 255)
+  if value == target_value then
+    draw_rect(rect_x + 5, rect_y + 5, radius - 10, radius - 10, true, 100, 175, 220, 255)
+  end
+  draw_text(label, rect_x + radius + 8, rect_y - 1, 225, 225, 225, 255, 1, "Segoe UI", 15)
+
+  if changed then
+    return target_value
+  end
+  return value
+end
+
+local function draw_text_input(ui, id, label, rect_x, rect_y, rect_w, rect_h, value)
+  draw_text(label, rect_x, rect_y - 22, 215, 215, 215, 255, 1, "Segoe UI", 14)
+
+  local hovered = point_in_rect(ui.mouse_x, ui.mouse_y, rect_x, rect_y, rect_w, rect_h)
+  if hovered and ui.mouse_pressed then
+    ui.focus_field = id
+    ui.active_mouse_id = nil
+  elseif ui.mouse_pressed and not hovered and ui.focus_field == id then
+    ui.focus_field = nil
+  end
+
+  local is_focused = ui.focus_field == id
+  draw_rect(rect_x, rect_y, rect_w, rect_h, true, 26, 26, 26, 255)
+  draw_rect(rect_x, rect_y, rect_w, rect_h, false, is_focused and 110 or 78, is_focused and 145 or 78, is_focused and 210 or 78, 255)
+
+  local text_value = tostring(value or "")
+  if is_focused and ui.key_char > 0 then
+    if ui.key_char == 8 then
+      text_value = text_value:sub(1, math.max(#text_value - 1, 0))
+    elseif ui.key_char == 13 then
+      ui.focus_field = nil
+    elseif ui.key_char == 27 then
+      ui.focus_field = nil
+      ui.consume_escape = true
+    elseif ui.key_char >= 32 and ui.key_char <= 126 then
+      text_value = text_value .. string.char(ui.key_char)
+    end
+  end
+
+  local draw_value = shorten_text(text_value, math.max(8, math.floor(rect_w / 8)))
+  draw_text(draw_value, rect_x + 8, rect_y + 7, 240, 240, 240, 255, 1, "Consolas", 15)
+  return text_value
+end
+
+local function show_mode_menu(ui, rect_x, rect_y)
+  local items = {}
+  local mapping = { "single", "batch", "rebuild", "compare" }
+  for _, mode in ipairs(mapping) do
+    local label = get_mode_label(mode)
+    if mode == ui.mode then
+      label = "!" .. label
+    end
+    items[#items + 1] = label
+  end
+
+  gfx.x = rect_x
+  gfx.y = rect_y
+  local selection = gfx.showmenu(table.concat(items, "|"))
+  local chosen_mode = mapping[selection]
+  if chosen_mode then
+    ui.mode = chosen_mode
+    if chosen_mode == "batch" then
+      ui.source_scope = "all_folder_tracks"
+    elseif chosen_mode == "single" and ui.source_scope == "all_folder_tracks" then
+      ui.source_scope = "selected_folder"
+    end
+    save_ui_settings(ui)
+    set_status(ui, "Mode: " .. get_mode_label(chosen_mode))
+  end
+end
+
+local function browse_output_folder(current_value)
+  local current_path = trim_string(current_value)
+  if current_path == "" then
+    current_path = get_default_output_dir()
+  end
+
+  if reaper.JS_Dialog_BrowseForFolder then
+    local ok, folder = reaper.JS_Dialog_BrowseForFolder("Select output folder", current_path)
+    if ok and trim_string(folder) ~= "" then
+      return normalize_path(folder)
+    end
+  end
+
+  local ok, value = reaper.GetUserInputs(
+    SCRIPT_TITLE .. " - Output Folder",
+    1,
+    "Output Folder",
+    current_path
+  )
+  if ok then
+    return normalize_path(value)
+  end
+
+  return nil
+end
+
+local function prompt_custom_library_entry(existing_entry)
+  local existing_patterns = {}
+  if existing_entry and existing_entry.patterns then
+    for _, pattern in ipairs(existing_entry.patterns) do
+      existing_patterns[#existing_patterns + 1] = pattern
+    end
+  end
+
+  local ok, values = reaper.GetUserInputs(
+    SCRIPT_TITLE .. " - Custom Library Pattern",
+    2,
+    table.concat({
+      "extrawidth=420",
+      "separator=|",
+      "Library Name",
+      "Path Patterns (; separated)",
+    }, ","),
+    table.concat({
+      existing_entry and existing_entry.name or "",
+      table.concat(existing_patterns, ";"),
+    }, "|")
+  )
+
+  if not ok then
+    return nil, "User cancelled."
+  end
+
+  local parts = split_delimited(values, "|", 2)
+  local name = trim_string(parts[1])
+  local pattern_text = trim_string(parts[2])
+  if name == "" then
+    return nil, "Library name is required."
+  end
+  if pattern_text == "" then
+    return nil, "At least one path pattern is required."
+  end
+
+  local patterns = {}
+  for pattern in pattern_text:gmatch("[^;]+") do
+    local clean = trim_string(pattern):lower()
+    if clean ~= "" then
+      patterns[#patterns + 1] = clean
+    end
+  end
+
+  if #patterns == 0 then
+    return nil, "At least one valid path pattern is required."
+  end
+
+  return {
+    name = name,
+    patterns = patterns,
+  }
+end
+
+local function choose_custom_library_index(patterns, title)
+  if #patterns == 0 then
+    return nil
+  end
+
+  local items = {}
+  for index, entry in ipairs(patterns) do
+    items[#items + 1] = string.format("%d. %s", index, trim_string(entry.name))
+  end
+
+  gfx.x = gfx.mouse_x
+  gfx.y = gfx.mouse_y
+  local selection = gfx.showmenu(table.concat(items, "|"))
+  if selection and selection > 0 then
+    return selection
+  end
+
+  local ok, value = reaper.GetUserInputs(title, 1, "Library Index", "1")
+  if not ok then
+    return nil
+  end
+
+  local numeric = tonumber(trim_string(value))
+  if not numeric then
+    return nil
+  end
+  numeric = math.floor(clamp_number(numeric, 1, #patterns))
+  return numeric
+end
+
+local function update_custom_library_patterns_from_ui(ui, patterns, status_message)
+  ui.custom_library_patterns = serialize_custom_library_patterns(patterns)
+  refresh_custom_library_patterns(ui.custom_library_patterns)
+  save_ui_settings(ui)
+  set_status(ui, status_message)
+end
+
+local function manage_custom_library_patterns(ui)
+  local patterns = parse_custom_library_patterns(ui.custom_library_patterns)
+  gfx.x = gfx.mouse_x
+  gfx.y = gfx.mouse_y
+  local selection = gfx.showmenu("Add Pattern...|Edit Pattern...|Remove Pattern...|Clear All")
+
+  if selection == 1 then
+    local entry, entry_error = prompt_custom_library_entry(nil)
+    if not entry then
+      if entry_error and entry_error ~= "User cancelled." then
+        set_status(ui, entry_error)
+      end
+      return
+    end
+    patterns[#patterns + 1] = entry
+    update_custom_library_patterns_from_ui(ui, patterns, "Added custom library: " .. entry.name)
+    return
+  end
+
+  if selection == 2 then
+    if #patterns == 0 then
+      set_status(ui, "No custom library patterns to edit.")
+      return
+    end
+    local index = choose_custom_library_index(patterns, SCRIPT_TITLE .. " - Edit Custom Library")
+    if not index then
+      return
+    end
+    local entry, entry_error = prompt_custom_library_entry(patterns[index])
+    if not entry then
+      if entry_error and entry_error ~= "User cancelled." then
+        set_status(ui, entry_error)
+      end
+      return
+    end
+    patterns[index] = entry
+    update_custom_library_patterns_from_ui(ui, patterns, "Updated custom library: " .. entry.name)
+    return
+  end
+
+  if selection == 3 then
+    if #patterns == 0 then
+      set_status(ui, "No custom library patterns to remove.")
+      return
+    end
+    local index = choose_custom_library_index(patterns, SCRIPT_TITLE .. " - Remove Custom Library")
+    if not index then
+      return
+    end
+    local removed_name = trim_string(patterns[index].name)
+    table.remove(patterns, index)
+    update_custom_library_patterns_from_ui(ui, patterns, "Removed custom library: " .. removed_name)
+    return
+  end
+
+  if selection == 4 then
+    local confirm = reaper.ShowMessageBox(
+      "Clear all custom library patterns?",
+      SCRIPT_TITLE,
+      4
+    )
+    if confirm == 6 then
+      update_custom_library_patterns_from_ui(ui, {}, "Cleared custom library patterns.")
+    end
+  end
+end
+
+local function draw_preview_panel(ui, rect_x, rect_y, rect_w, rect_h)
+  local settings = build_settings_from_ui(ui)
+  local output_dir = resolve_output_dir(settings.output_folder)
+  local export_labels = {}
+  local custom_patterns = parse_custom_library_patterns(settings.custom_library_patterns)
+
+  if settings.export_console then
+    export_labels[#export_labels + 1] = "Console"
+  end
+  if settings.export_markdown then
+    export_labels[#export_labels + 1] = "Markdown"
+  end
+  if settings.export_csv then
+    export_labels[#export_labels + 1] = "CSV"
+  end
+  if settings.export_json then
+    export_labels[#export_labels + 1] = "JSON"
+  end
+
+  draw_rect(rect_x, rect_y, rect_w, rect_h, true, 20, 20, 20, 255)
+  draw_rect(rect_x, rect_y, rect_w, rect_h, false, 60, 60, 60, 255)
+
+  local line_y = rect_y + 14
+  local lines = {
+    "Mode: " .. get_mode_label(settings.mode),
+    "Scope: " .. get_scope_label(settings.source_scope),
+    "Exports: " .. (#export_labels > 0 and table.concat(export_labels, ", ") or "(none)"),
+    "Output Dir: " .. shorten_text(output_dir, 58),
+    "Prefix Filter: " .. (settings.prefix_filter ~= "" and settings.prefix_filter or "(all)"),
+    "Source Details: " .. (settings.include_source_info and "on" or "off"),
+    "FX Params: " .. (settings.include_fx_parameters and (settings.verbose_fx_parameters and "verbose" or "filtered") or "summary only"),
+    "Paths: " .. (settings.include_file_paths and "on" or "off"),
+    "Sends: " .. (settings.include_sends and "on" or "off"),
+    "Library Detect: " .. (settings.auto_detect_library and "on" or "off"),
+    "Custom Libraries: " .. tostring(#custom_patterns),
+    "Notes Prompt: " .. (settings.add_notes_prompt and "on" or "off"),
+    "Auto Tags: " .. (settings.auto_tag_keywords and "on" or "off"),
+  }
+
+  if settings.mode == "rebuild" then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Rebuild JSON: " .. shorten_text(settings.rebuild_json_path ~= "" and settings.rebuild_json_path or "(prompt on run)", 58)
+    lines[#lines + 1] = "Restore FX: " .. ((settings.rebuild_restore_fx and settings.rebuild_restore_master_fx) and "layers + folder" or (settings.rebuild_restore_fx and "layers only" or (settings.rebuild_restore_master_fx and "folder only" or "off")))
+    lines[#lines + 1] = "Restore Sends: " .. (settings.rebuild_restore_sends and "on" or "off")
+    lines[#lines + 1] = "Create Send Tracks: " .. (settings.rebuild_create_missing_send_tracks and "on" or "off")
+  elseif settings.mode == "compare" then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Old JSON: " .. shorten_text(settings.compare_old_json_path ~= "" and settings.compare_old_json_path or "(prompt on run)", 61)
+    lines[#lines + 1] = "New JSON: " .. shorten_text(settings.compare_new_json_path ~= "" and settings.compare_new_json_path or "(prompt on run)", 61)
+  end
+
+  draw_text("Current Configuration", rect_x + 14, line_y, 240, 240, 240, 255, 1, "Segoe UI Semibold", 16)
+  line_y = line_y + 32
+
+  for _, line in ipairs(lines) do
+    if line == "" then
+      line_y = line_y + 10
+    else
+      draw_text(shorten_text(line, 72), rect_x + 16, line_y, 205, 205, 205, 255, 1, "Consolas", 14)
+      line_y = line_y + 22
+    end
+  end
+end
+
+local function perform_run_from_ui(ui)
+  local settings = build_settings_from_ui(ui)
+  if not has_any_output_enabled(settings) then
+    set_status(ui, "Select at least one output format.")
+    return
+  end
+
+  save_settings(settings)
+
+  local success, run_ok, result_message = xpcall(function()
+    return run_mode(settings)
+  end, function(message)
+    return debug.traceback(message, 2)
+  end)
+
+  if not success then
+    reaper.ShowMessageBox(tostring(run_ok), SCRIPT_TITLE, 0)
+    set_status(ui, "Run failed. See error dialog.")
+    return
+  end
+
+  apply_settings_to_ui(ui, settings)
+
+  if not run_ok then
+    if result_message and result_message ~= "User cancelled." then
+      reaper.ShowMessageBox(result_message, SCRIPT_TITLE, 0)
+      set_status(ui, shorten_text(result_message, 96))
+    else
+      set_status(ui, "Action cancelled.")
+    end
+    return
+  end
+
+  local headline = result_message:match("([^\n]+)") or "Completed."
+  set_status(ui, headline)
+  reaper.ShowMessageBox(result_message, SCRIPT_TITLE, 0)
+end
+
+local function run_gfx_ui(current_settings)
+  if not gfx or not gfx.init then
+    return false
+  end
+
+  local ui = {
+    width = 1100,
+    height = 820,
+    mode = current_settings.mode or DEFAULTS.mode,
+    source_scope = current_settings.source_scope or DEFAULTS.source_scope,
+    output_folder = current_settings.output_folder or DEFAULTS.output_folder,
+    export_console = current_settings.export_console,
+    export_markdown = current_settings.export_markdown,
+    export_csv = current_settings.export_csv,
+    export_json = current_settings.export_json,
+    include_source_info = current_settings.include_source_info,
+    include_fx_parameters = current_settings.include_fx_parameters,
+    verbose_fx_parameters = current_settings.verbose_fx_parameters,
+    include_file_paths = current_settings.include_file_paths,
+    include_sends = current_settings.include_sends,
+    add_notes_prompt = current_settings.add_notes_prompt,
+    auto_detect_library = current_settings.auto_detect_library,
+    auto_tag_keywords = current_settings.auto_tag_keywords,
+    prefix_filter = current_settings.prefix_filter or DEFAULTS.prefix_filter,
+    rebuild_json_path = current_settings.rebuild_json_path or DEFAULTS.rebuild_json_path,
+    compare_old_json_path = current_settings.compare_old_json_path or DEFAULTS.compare_old_json_path,
+    compare_new_json_path = current_settings.compare_new_json_path or DEFAULTS.compare_new_json_path,
+    rebuild_restore_fx = current_settings.rebuild_restore_fx,
+    rebuild_restore_master_fx = current_settings.rebuild_restore_master_fx,
+    rebuild_restore_sends = current_settings.rebuild_restore_sends,
+    rebuild_create_missing_send_tracks = current_settings.rebuild_create_missing_send_tracks,
+    custom_library_patterns = current_settings.custom_library_patterns or DEFAULTS.custom_library_patterns,
+    mouse_x = 0,
+    mouse_y = 0,
+    mouse_down = false,
+    prev_mouse_down = false,
+    mouse_pressed = false,
+    mouse_released = false,
+    active_mouse_id = nil,
+    focus_field = nil,
+    key_char = 0,
+    consume_escape = false,
+    status_message = "Ready.",
+  }
+
+  if ui.mode == "batch" then
+    ui.source_scope = "all_folder_tracks"
+  end
+
+  gfx.init(SCRIPT_TITLE, ui.width, ui.height, 0)
+  if (gfx.w or 0) <= 0 then
+    return false
+  end
+
+  local function loop()
+    local key = gfx.getchar()
+    if key < 0 then
+      save_ui_settings(ui)
+      gfx.quit()
+      return
+    end
+
+    ui.key_char = key
+    ui.consume_escape = false
+    ui.mouse_x = gfx.mouse_x
+    ui.mouse_y = gfx.mouse_y
+    ui.mouse_down = ((gfx.mouse_cap or 0) % 2) == 1
+    ui.mouse_pressed = ui.mouse_down and not ui.prev_mouse_down
+    ui.mouse_released = (not ui.mouse_down) and ui.prev_mouse_down
+
+    draw_rect(0, 0, ui.width, ui.height, true, 16, 18, 22, 255)
+    draw_text(SCRIPT_TITLE, 24, 18, 245, 245, 245, 255, 1, "Segoe UI Semibold", 22)
+    draw_text("Phase 3: rebuild, compare, recipe-book export, custom library patterns", 24, 48, 150, 170, 185, 255, 1, "Segoe UI", 13)
+
+    draw_rect(20, 82, 500, 680, true, 24, 24, 24, 255)
+    draw_rect(20, 82, 500, 680, false, 58, 58, 58, 255)
+    draw_rect(540, 82, 540, 680, true, 24, 24, 24, 255)
+    draw_rect(540, 82, 540, 680, false, 58, 58, 58, 255)
+
+    draw_text("Mode", 40, 104, 235, 235, 235, 255, 1, "Segoe UI Semibold", 16)
+    if draw_button(ui, "mode_menu", get_mode_label(ui.mode), 40, 132, 220, 34, true) then
+      show_mode_menu(ui, 40, 166)
+    end
+
+    draw_text("Source", 40, 192, 235, 235, 235, 255, 1, "Segoe UI Semibold", 16)
+    local previous_scope = ui.source_scope
+    ui.source_scope = draw_radio(ui, "scope_selected", "Selected folder track", 40, 222, ui.source_scope, "selected_folder")
+    ui.source_scope = draw_radio(ui, "scope_all", "All folder tracks", 40, 250, ui.source_scope, "all_folder_tracks")
+    if ui.mode == "single" and previous_scope ~= ui.source_scope and ui.source_scope == "all_folder_tracks" then
+      ui.mode = "batch"
+      set_status(ui, "Scope changed to all folder tracks. Mode switched to Batch All.")
+    elseif ui.mode == "batch" and previous_scope ~= ui.source_scope and ui.source_scope == "selected_folder" then
+      ui.mode = "single"
+      set_status(ui, "Scope changed to selected folder. Mode switched to Single Recipe.")
+    end
+
+    ui.prefix_filter = draw_text_input(ui, "prefix_filter", "Prefix Filter", 40, 316, 320, 34, ui.prefix_filter)
+
+    draw_text("Output Format", 40, 386, 235, 235, 235, 255, 1, "Segoe UI Semibold", 16)
+    ui.export_console = draw_checkbox(ui, "export_console", "Console report", 40, 418, ui.export_console)
+    ui.export_markdown = draw_checkbox(ui, "export_markdown", "Markdown (.md)", 40, 446, ui.export_markdown)
+    ui.export_csv = draw_checkbox(ui, "export_csv", "CSV (.csv)", 40, 474, ui.export_csv)
+    ui.export_json = draw_checkbox(ui, "export_json", "JSON (.json)", 40, 502, ui.export_json)
+
+    ui.output_folder = draw_text_input(ui, "output_folder", "Output Folder", 40, 570, 350, 34, ui.output_folder)
+    if draw_button(ui, "browse_output", "Browse...", 400, 570, 90, 34, true) then
+      local folder = browse_output_folder(ui.output_folder)
+      if folder then
+        ui.output_folder = folder
+        set_status(ui, "Output folder updated.")
+      end
+    end
+
+    draw_text("Detail Level", 560, 104, 235, 235, 235, 255, 1, "Segoe UI Semibold", 16)
+    ui.include_source_info = draw_checkbox(ui, "include_source_info", "Source file info", 560, 136, ui.include_source_info)
+    ui.include_fx_parameters = draw_checkbox(ui, "include_fx_parameters", "FX parameter details", 560, 164, ui.include_fx_parameters)
+    ui.include_sends = draw_checkbox(ui, "include_sends", "Sends / routing", 560, 192, ui.include_sends)
+    ui.verbose_fx_parameters = draw_checkbox(ui, "verbose_fx_parameters", "All FX parameters (verbose)", 560, 220, ui.verbose_fx_parameters)
+    ui.include_file_paths = draw_checkbox(ui, "include_file_paths", "Include file paths", 560, 248, ui.include_file_paths)
+    ui.auto_detect_library = draw_checkbox(ui, "auto_detect_library", "Auto-detect source library", 560, 276, ui.auto_detect_library)
+    if draw_button(ui, "custom_libraries", "Library Patterns...", 560, 304, 180, 32, true) then
+      manage_custom_library_patterns(ui)
+    end
+
+    draw_text("Notes & Tags", 560, 348, 235, 235, 235, 255, 1, "Segoe UI Semibold", 16)
+    ui.add_notes_prompt = draw_checkbox(ui, "add_notes_prompt", "Prompt for design notes", 560, 380, ui.add_notes_prompt)
+    ui.auto_tag_keywords = draw_checkbox(ui, "auto_tag_keywords", "Auto-tag from recipe name", 560, 408, ui.auto_tag_keywords)
+
+    draw_preview_panel(ui, 560, 456, 500, 212)
+
+    local run_label = ui.mode == "batch" and "Batch Crawl" or
+      (ui.mode == "single" and "Crawl Recipe" or
+      (ui.mode == "compare" and "Run Compare" or
+      (ui.mode == "rebuild" and "Run Rebuild" or "Run Mode")))
+    if draw_button(ui, "run_mode", run_label, 560, 694, 170, 38, true) then
+      perform_run_from_ui(ui)
+    end
+    if draw_button(ui, "run_compare", "Compare...", 742, 694, 110, 38, true) then
+      ui.mode = "compare"
+      perform_run_from_ui(ui)
+    end
+    if draw_button(ui, "run_rebuild", "Rebuild...", 864, 694, 110, 38, true) then
+      ui.mode = "rebuild"
+      perform_run_from_ui(ui)
+    end
+    if draw_button(ui, "close", "Close", 986, 694, 74, 38, true) then
+      save_ui_settings(ui)
+      gfx.quit()
+      return
+    end
+
+    draw_rect(20, 778, 1060, 1, true, 48, 48, 48, 255)
+    draw_text(shorten_text(ui.status_message, 150), 24, 788, 170, 205, 220, 255, 1, "Segoe UI", 13)
+
+    if key == 27 and not ui.consume_escape and ui.focus_field == nil then
+      save_ui_settings(ui)
+      gfx.quit()
+      return
+    end
+
+    if ui.mouse_released then
+      ui.active_mouse_id = nil
+    end
+    ui.prev_mouse_down = ui.mouse_down
+
+    gfx.update()
+    reaper.defer(loop)
+  end
+
+  loop()
+  return true
+end
+
+local function main()
+  clear_console()
+  local current_settings = load_settings()
+  local ok = run_gfx_ui(current_settings)
+  if not ok then
+    run_prompt_flow(current_settings)
   end
 end
 

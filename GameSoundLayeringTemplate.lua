@@ -27,6 +27,8 @@ local DEFAULTS = {
   include_fx = true,
   apply_colors = true,
   write_notes = true,
+  include_buses = false,
+  create_markers = false,
 }
 
 local function log_line(message)
@@ -151,6 +153,9 @@ local BUILTIN_TEMPLATES = {
       layer({
         name = "Attack",
         color = color(255, 100, 100),
+        sends = {
+          { bus = "Reverb_Bus", volume_db = -18.0, mode = "postfader" },
+        },
         fx_chain = {
           fx("ReaEQ", {
             { idx = 0, val = 1.0 },
@@ -176,6 +181,9 @@ local BUILTIN_TEMPLATES = {
         name = "Body",
         color = color(180, 80, 80),
         volume_db = -2.0,
+        sends = {
+          { bus = "Reverb_Bus", volume_db = -14.0, mode = "postfader" },
+        },
         fx_chain = {
           fx("ReaEQ", {
             { idx = 0, val = 0.0 },
@@ -190,6 +198,9 @@ local BUILTIN_TEMPLATES = {
         name = "Tail",
         color = color(150, 90, 90),
         volume_db = -6.0,
+        sends = {
+          { bus = "Reverb_Bus", volume_db = -8.0, mode = "postfader" },
+        },
         fx_chain = { fx("ReaVerbate", {}) },
         note = "Residual decay and space.\n- Match the environment size.\n- Keep enough separation from the main impact.",
       }),
@@ -197,8 +208,20 @@ local BUILTIN_TEMPLATES = {
         name = "Sweetener",
         color = color(120, 100, 100),
         volume_db = -8.0,
+        sends = {
+          { bus = "Reverb_Bus", volume_db = -12.0, mode = "postfader" },
+        },
         note = "Stylized detail layer.\n- Add texture, magic, sparks, or genre flavor.\n- Use sparingly so it supports the hit instead of masking it.",
       }),
+    },
+    buses = {
+      {
+        name = "Reverb_Bus",
+        color = color(100, 110, 180),
+        fx_chain = {
+          fx("ReaVerbate", {}),
+        },
+      },
     },
   },
   Footstep = {
@@ -296,6 +319,9 @@ local BUILTIN_TEMPLATES = {
       layer({
         name = "Base",
         color = color(110, 170, 110),
+        sends = {
+          { bus = "Space_Bus", volume_db = -12.0, mode = "postfader" },
+        },
         fx_chain = {
           fx("ReaEQ", {
             { idx = 0, val = 1.0 },
@@ -310,12 +336,18 @@ local BUILTIN_TEMPLATES = {
         name = "Detail",
         color = color(95, 155, 95),
         volume_db = -3.0,
+        sends = {
+          { bus = "Space_Bus", volume_db = -18.0, mode = "postfader" },
+        },
         note = "Fine detail such as birds, insects, drips, or distant texture.",
       }),
       layer({
         name = "Accent",
         color = color(85, 145, 85),
         volume_db = -6.0,
+        sends = {
+          { bus = "Space_Bus", volume_db = -10.0, mode = "postfader" },
+        },
         fx_chain = { fx("ReaVerbate", {}) },
         note = "Intermittent accents like leaves, drops, creaks, or gusts.",
       }),
@@ -325,6 +357,9 @@ local BUILTIN_TEMPLATES = {
         volume_db = -9.0,
         note = "Optional low-frequency rumble or environmental weight.",
       }),
+    },
+    buses = {
+      { name = "Space_Bus", color = color(90, 120, 165), fx_chain = { fx("ReaVerbate", {}) } },
     },
   },
   Explosion = {
@@ -336,6 +371,9 @@ local BUILTIN_TEMPLATES = {
       layer({
         name = "Transient",
         color = color(255, 185, 90),
+        sends = {
+          { bus = "Impact_Bus", volume_db = -18.0, mode = "postfader" },
+        },
         fx_chain = {
           fx("ReaEQ", {
             { idx = 0, val = 1.0 },
@@ -352,17 +390,23 @@ local BUILTIN_TEMPLATES = {
         },
         note = "Initial crack and transient spike.\n- Preserve sharpness before the low-end bloom arrives.",
       }),
-      layer({ name = "LowEnd", color = color(235, 150, 70), volume_db = -2.0, note = "Sub and low-frequency impact weight." }),
-      layer({ name = "Body", color = color(215, 125, 50), volume_db = -1.0, note = "Midrange blast body, crunch, and density." }),
+      layer({ name = "LowEnd", color = color(235, 150, 70), volume_db = -2.0, sends = { { bus = "Impact_Bus", volume_db = -18.0, mode = "postfader" } }, note = "Sub and low-frequency impact weight." }),
+      layer({ name = "Body", color = color(215, 125, 50), volume_db = -1.0, sends = { { bus = "Impact_Bus", volume_db = -14.0, mode = "postfader" } }, note = "Midrange blast body, crunch, and density." }),
       layer({ name = "Debris", color = color(190, 110, 45), volume_db = -5.0, note = "Shrapnel, rocks, dirt, and fallout material." }),
       layer({
         name = "Tail",
         color = color(165, 95, 40),
         volume_db = -7.0,
+        sends = {
+          { bus = "Impact_Bus", volume_db = -8.0, mode = "postfader" },
+        },
         fx_chain = { fx("ReaVerbate", {}) },
         note = "Long decay, roll-off, and reflections.",
       }),
       layer({ name = "Sweetener", color = color(140, 85, 40), volume_db = -9.0, note = "Stylized energy, chemical sizzle, or sci-fi detail." }),
+    },
+    buses = {
+      { name = "Impact_Bus", color = color(100, 110, 175), fx_chain = { fx("ReaVerbate", {}) } },
     },
   },
   Weapon_Ranged = {
@@ -371,12 +415,15 @@ local BUILTIN_TEMPLATES = {
     category_prefix = "SFX_Weapon",
     folder = { name = "SFX_Weapon_[AssetName]", color = color(200, 80, 40) },
     layers = {
-      layer({ name = "Mech", color = color(235, 135, 95), note = "Mechanical movement such as trigger, bolt, or reload detail." }),
-      layer({ name = "Fire", color = color(255, 115, 70), note = "Primary firing impact. This is the core shot signature." }),
+      layer({ name = "Mech", color = color(235, 135, 95), sends = { { bus = "Tail_Bus", volume_db = -18.0, mode = "postfader" } }, note = "Mechanical movement such as trigger, bolt, or reload detail." }),
+      layer({ name = "Fire", color = color(255, 115, 70), sends = { { bus = "Tail_Bus", volume_db = -16.0, mode = "postfader" } }, note = "Primary firing impact. This is the core shot signature." }),
       layer({ name = "Punch", color = color(180, 90, 55), volume_db = -3.0, note = "Low-frequency punch or sub reinforcement." }),
-      layer({ name = "Tail", color = color(150, 90, 70), volume_db = -6.0, note = "Reflection and environment tail." }),
-      layer({ name = "Sweetener", color = color(135, 95, 85), volume_db = -8.0, note = "Stylized extra layer such as electricity, magic, or plasma." }),
+      layer({ name = "Tail", color = color(150, 90, 70), volume_db = -6.0, sends = { { bus = "Tail_Bus", volume_db = -8.0, mode = "postfader" } }, note = "Reflection and environment tail." }),
+      layer({ name = "Sweetener", color = color(135, 95, 85), volume_db = -8.0, sends = { { bus = "Tail_Bus", volume_db = -12.0, mode = "postfader" } }, note = "Stylized extra layer such as electricity, magic, or plasma." }),
       layer({ name = "Shell", color = color(120, 95, 75), volume_db = -10.0, note = "Shell, debris, or byproduct element. Optional." }),
+    },
+    buses = {
+      { name = "Tail_Bus", color = color(95, 105, 175), fx_chain = { fx("ReaVerbate", {}) } },
     },
   },
   Weapon_Magic = {
@@ -385,12 +432,15 @@ local BUILTIN_TEMPLATES = {
     category_prefix = "SFX_Weapon",
     folder = { name = "SFX_Weapon_[AssetName]", color = color(120, 60, 200) },
     layers = {
-      layer({ name = "Charge", color = color(165, 110, 240), note = "Charge-up or anticipation layer." }),
-      layer({ name = "Cast", color = color(145, 95, 230), note = "Casting impact or release moment." }),
-      layer({ name = "Element", color = color(125, 80, 220), note = "Element identity such as fire, ice, lightning, poison, or arcane." }),
+      layer({ name = "Charge", color = color(165, 110, 240), sends = { { bus = "MagicSpace_Bus", volume_db = -16.0, mode = "postfader" } }, note = "Charge-up or anticipation layer." }),
+      layer({ name = "Cast", color = color(145, 95, 230), sends = { { bus = "MagicSpace_Bus", volume_db = -14.0, mode = "postfader" } }, note = "Casting impact or release moment." }),
+      layer({ name = "Element", color = color(125, 80, 220), sends = { { bus = "MagicSpace_Bus", volume_db = -12.0, mode = "postfader" } }, note = "Element identity such as fire, ice, lightning, poison, or arcane." }),
       layer({ name = "Whoosh", color = color(110, 75, 205), volume_db = -3.0, note = "Projectile travel or motion pass-by." }),
-      layer({ name = "Impact", color = color(95, 70, 190), note = "Target hit or arrival impact." }),
-      layer({ name = "Tail", color = color(85, 65, 175), volume_db = -6.0, note = "Decay, shimmer, or dissipation layer." }),
+      layer({ name = "Impact", color = color(95, 70, 190), sends = { { bus = "MagicSpace_Bus", volume_db = -14.0, mode = "postfader" } }, note = "Target hit or arrival impact." }),
+      layer({ name = "Tail", color = color(85, 65, 175), volume_db = -6.0, sends = { { bus = "MagicSpace_Bus", volume_db = -8.0, mode = "postfader" } }, note = "Decay, shimmer, or dissipation layer." }),
+    },
+    buses = {
+      { name = "MagicSpace_Bus", color = color(110, 95, 185), fx_chain = { fx("ReaVerbate", {}) } },
     },
   },
   Creature = {
@@ -399,11 +449,14 @@ local BUILTIN_TEMPLATES = {
     category_prefix = "SFX_Creature",
     folder = { name = "SFX_Creature_[AssetName]", color = color(160, 60, 160) },
     layers = {
-      layer({ name = "Vocal", color = color(210, 110, 210), note = "Primary voice layer such as growl, scream, or bark." }),
-      layer({ name = "Breath", color = color(190, 95, 190), volume_db = -4.0, note = "Breath, air, or pressure detail." }),
-      layer({ name = "Texture", color = color(175, 85, 175), volume_db = -5.0, note = "Organic texture such as slime, scales, or wetness." }),
+      layer({ name = "Vocal", color = color(210, 110, 210), sends = { { bus = "CreatureSpace_Bus", volume_db = -14.0, mode = "postfader" } }, note = "Primary voice layer such as growl, scream, or bark." }),
+      layer({ name = "Breath", color = color(190, 95, 190), volume_db = -4.0, sends = { { bus = "CreatureSpace_Bus", volume_db = -18.0, mode = "postfader" } }, note = "Breath, air, or pressure detail." }),
+      layer({ name = "Texture", color = color(175, 85, 175), volume_db = -5.0, sends = { { bus = "CreatureSpace_Bus", volume_db = -16.0, mode = "postfader" } }, note = "Organic texture such as slime, scales, or wetness." }),
       layer({ name = "Movement", color = color(160, 75, 160), volume_db = -6.0, note = "Body movement such as wings, claws, or cloth." }),
       layer({ name = "Processed", color = color(145, 70, 145), volume_db = -6.0, note = "Pitch-shifted or heavily processed support layer." }),
+    },
+    buses = {
+      { name = "CreatureSpace_Bus", color = color(105, 100, 180), fx_chain = { fx("ReaVerbate", {}) } },
     },
   },
   Vehicle = {
@@ -430,7 +483,10 @@ local BUILTIN_TEMPLATES = {
       layer({ name = "Harmony", color = color(235, 195, 95), volume_db = -3.0, note = "Harmony or chord support." }),
       layer({ name = "Rhythm", color = color(220, 180, 75), volume_db = -2.0, note = "Percussive or rhythmic layer." }),
       layer({ name = "Bass", color = color(200, 160, 65), volume_db = -4.0, note = "Low-end support and grounding." }),
-      layer({ name = "FX", color = color(180, 145, 60), volume_db = -5.0, note = "Impacts, risers, reverses, and transition detail." }),
+      layer({ name = "FX", color = color(180, 145, 60), volume_db = -5.0, sends = { { bus = "MusicFX_Bus", volume_db = -10.0, mode = "postfader" } }, note = "Impacts, risers, reverses, and transition detail." }),
+    },
+    buses = {
+      { name = "MusicFX_Bus", color = color(95, 110, 175), fx_chain = { fx("ReaVerbate", {}) } },
     },
   },
 }
@@ -584,6 +640,8 @@ local function load_settings()
     include_fx = parse_boolean(get_ext_state("include_fx", bool_to_string(DEFAULTS.include_fx)), DEFAULTS.include_fx),
     apply_colors = parse_boolean(get_ext_state("apply_colors", bool_to_string(DEFAULTS.apply_colors)), DEFAULTS.apply_colors),
     write_notes = parse_boolean(get_ext_state("write_notes", bool_to_string(DEFAULTS.write_notes)), DEFAULTS.write_notes),
+    include_buses = parse_boolean(get_ext_state("include_buses", bool_to_string(DEFAULTS.include_buses)), DEFAULTS.include_buses),
+    create_markers = parse_boolean(get_ext_state("create_markers", bool_to_string(DEFAULTS.create_markers)), DEFAULTS.create_markers),
   }
 end
 
@@ -594,6 +652,8 @@ local function save_settings(settings)
   reaper.SetExtState(EXT_SECTION, "include_fx", bool_to_string(settings.include_fx), true)
   reaper.SetExtState(EXT_SECTION, "apply_colors", bool_to_string(settings.apply_colors), true)
   reaper.SetExtState(EXT_SECTION, "write_notes", bool_to_string(settings.write_notes), true)
+  reaper.SetExtState(EXT_SECTION, "include_buses", bool_to_string(settings.include_buses), true)
+  reaper.SetExtState(EXT_SECTION, "create_markers", bool_to_string(settings.create_markers), true)
 end
 
 local function is_array_table(value)
@@ -642,7 +702,9 @@ local function serialize_value(value)
 end
 
 local function deserialize_value(serialized)
-  local chunk, err = load("return " .. tostring(serialized or ""), SCRIPT_TITLE .. "_Deserialize", "t", {})
+  local text = tostring(serialized or "")
+  local prefix = text:match("^%s*return%s") and "" or "return "
+  local chunk, err = load(prefix .. text, SCRIPT_TITLE .. "_Deserialize", "t", {})
   if not chunk then
     return nil, err
   end
@@ -821,6 +883,28 @@ local function capture_fx_chain(track)
   return chain
 end
 
+local function capture_layer_sends(track, bus_lookup)
+  local sends = {}
+  local send_count = reaper.GetTrackNumSends(track, 0)
+
+  for send_index = 0, send_count - 1 do
+    local dest_track = reaper.GetTrackSendInfo_Value(track, 0, send_index, "P_DESTTRACK")
+    for bus_name, bus_track in pairs(bus_lookup) do
+      if dest_track == bus_track then
+        sends[#sends + 1] = {
+          bus = bus_name,
+          volume_db = round_to(linear_to_db(reaper.GetTrackSendInfo_Value(track, 0, send_index, "D_VOL") or 1.0), 3),
+          pan = round_to(reaper.GetTrackSendInfo_Value(track, 0, send_index, "D_PAN") or 0.0, 3),
+          mode = ({ [0] = "postfader", [1] = "prefx", [3] = "postfx" })[math.floor(reaper.GetTrackSendInfo_Value(track, 0, send_index, "I_SENDMODE") or 0)] or "postfader",
+          mute = reaper.GetTrackSendInfo_Value(track, 0, send_index, "B_MUTE") > 0.5,
+        }
+      end
+    end
+  end
+
+  return sends
+end
+
 local function capture_template_from_selection()
   local selected_count = reaper.CountSelectedTracks(0)
   if selected_count < 2 then
@@ -880,8 +964,40 @@ local function capture_template_from_selection()
     is_custom = true,
   }
 
-  for index = 1, selected_count - 1 do
-    local track = reaper.GetSelectedTrack(0, index)
+  local selected_tracks = {}
+  for index = 0, selected_count - 1 do
+    selected_tracks[#selected_tracks + 1] = reaper.GetSelectedTrack(0, index)
+  end
+
+  local layer_tracks = {}
+  local bus_tracks = {}
+  local open_depth = 1
+  for index = 2, #selected_tracks do
+    local track = selected_tracks[index]
+    if open_depth > 0 then
+      layer_tracks[#layer_tracks + 1] = track
+      local folder_delta = math.floor((reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH") or 0) + 0.5)
+      open_depth = open_depth + folder_delta
+    else
+      bus_tracks[#bus_tracks + 1] = track
+    end
+  end
+
+  local bus_lookup = {}
+  if #bus_tracks > 0 then
+    template.buses = {}
+    for _, bus_track in ipairs(bus_tracks) do
+      local bus_name = get_track_name(bus_track)
+      bus_lookup[bus_name] = bus_track
+      template.buses[#template.buses + 1] = {
+        name = bus_name,
+        color = get_track_color_definition(bus_track),
+        fx_chain = capture_fx_chain(bus_track),
+      }
+    end
+  end
+
+  for _, track in ipairs(layer_tracks) do
     local _, existing_note = reaper.GetSetMediaTrackInfo_String(track, "P_EXT:GameSoundLayerNote", "", false)
     template.layers[#template.layers + 1] = layer({
       name = get_track_name(track),
@@ -889,6 +1005,7 @@ local function capture_template_from_selection()
       volume_db = round_to(linear_to_db(reaper.GetMediaTrackInfo_Value(track, "D_VOL") or 1.0), 3),
       pan = round_to(reaper.GetMediaTrackInfo_Value(track, "D_PAN") or 0.0, 3),
       fx_chain = capture_fx_chain(track),
+      sends = capture_layer_sends(track, bus_lookup),
       note = trim_string(existing_note),
     })
   end
@@ -900,23 +1017,161 @@ local function capture_template_from_selection()
   return template
 end
 
+local function parse_csv_asset_text(text)
+  local names = {}
+  local seen = {}
+
+  for line in tostring(text or ""):gmatch("[^\r\n]+") do
+    local first_cell = trim_string((line:match("^%s*([^,\t;]+)") or ""))
+    local lowered = normalize_token(first_cell)
+    if first_cell ~= "" and lowered ~= "assetname" and lowered ~= "asset" and lowered ~= "name" and lowered ~= "id" then
+      local sanitized = sanitize_asset_name(first_cell)
+      if sanitized ~= "" and not seen[sanitized] then
+        seen[sanitized] = true
+        names[#names + 1] = sanitized
+      end
+    end
+  end
+
+  return names
+end
+
+local function read_text_file(path)
+  local handle, err = io.open(path, "rb")
+  if not handle then
+    return nil, err
+  end
+  local content = handle:read("*a")
+  handle:close()
+  return content
+end
+
+local function write_text_file(path, content)
+  local handle, err = io.open(path, "wb")
+  if not handle then
+    return false, err
+  end
+  handle:write(content or "")
+  handle:close()
+  return true
+end
+
+local function export_templates_to_file(path, templates)
+  local payload = {
+    version = 1,
+    templates = templates,
+  }
+  return write_text_file(path, "return " .. serialize_value(payload))
+end
+
+local function import_templates_from_file(path)
+  local content, err = read_text_file(path)
+  if not content then
+    return nil, err
+  end
+
+  content = content:gsub("^\239\187\191", "")
+  local payload, load_err = deserialize_value(content)
+  if type(payload) ~= "table" then
+    return nil, load_err or "Invalid template file."
+  end
+
+  local templates = payload.templates or payload
+  if type(templates) ~= "table" then
+    return nil, "Template file does not contain a template list."
+  end
+  if templates.name then
+    templates = { templates }
+  end
+
+  local imported_ids = {}
+  for _, template in ipairs(templates) do
+    if type(template) == "table" and trim_string(template.name) ~= "" then
+      imported_ids[#imported_ids + 1] = save_custom_template(template)
+    end
+  end
+
+  if #imported_ids == 0 then
+    return nil, "No valid templates were found in the file."
+  end
+
+  return imported_ids
+end
+
+local function resolve_send_mode(mode_name)
+  local lowered = trim_string(mode_name):lower()
+  if lowered == "prefx" or lowered == "pre" then
+    return 1
+  end
+  if lowered == "postfx" then
+    return 3
+  end
+  return 0
+end
+
+local function build_bus_track_name(bus_definition, asset_name)
+  local template_name = trim_string(bus_definition.name or "Bus")
+  if template_name:find("%[AssetName%]") then
+    return template_name:gsub("%[AssetName%]", asset_name)
+  end
+  return template_name .. "_" .. asset_name
+end
+
+local function apply_track_send(source_track, send_definition, bus_track, stats)
+  local send_index = reaper.CreateTrackSend(source_track, bus_track)
+  if send_index < 0 then
+    return false
+  end
+
+  if send_definition.volume_db ~= nil then
+    reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "D_VOL", db_to_linear(send_definition.volume_db))
+  end
+  if send_definition.pan ~= nil then
+    reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "D_PAN", tonumber(send_definition.pan) or 0.0)
+  end
+  if send_definition.mute ~= nil then
+    reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "B_MUTE", send_definition.mute and 1 or 0)
+  end
+
+  reaper.SetTrackSendInfo_Value(source_track, 0, send_index, "I_SENDMODE", resolve_send_mode(send_definition.mode))
+  stats.created_sends = stats.created_sends + 1
+  return true
+end
+
+local function create_guide_markers(asset_name, start_position, stats)
+  local markers = {
+    { offset = 0.0, name = asset_name .. " - Start: layer your sounds here" },
+    { offset = 5.0, name = asset_name .. " - Check: solo each layer" },
+    { offset = 10.0, name = asset_name .. " - Mix: balance and print" },
+  }
+
+  for _, marker in ipairs(markers) do
+    reaper.AddProjectMarker2(0, false, start_position + marker.offset, 0.0, marker.name, -1, 0)
+    stats.created_markers = stats.created_markers + 1
+  end
+end
+
 local function prompt_for_settings(current, template_lookup, templates, order)
   local defaults = {
     current.template_key or DEFAULTS.template_key,
     current.asset_names or DEFAULTS.asset_names,
     current.insert_mode or DEFAULTS.insert_mode,
+    bool_to_string(current.include_buses),
+    bool_to_string(current.create_markers),
   }
 
   while true do
     local ok, csv = reaper.GetUserInputs(
       SCRIPT_TITLE,
-      3,
+      5,
       table.concat({
         "extrawidth=420",
         "separator=|",
         "Template Key (? = list)",
         "Asset Name(s) (comma separated)",
         "Insert Position (end/cursor=selected track)",
+        "Include Bus Tracks (y/n)",
+        "Create Guide Markers (y/n)",
       }, ","),
       table.concat(defaults, "|")
     )
@@ -925,7 +1180,7 @@ local function prompt_for_settings(current, template_lookup, templates, order)
       return nil, "User cancelled."
     end
 
-    local parts = split_delimited(csv, "|", 3)
+    local parts = split_delimited(csv, "|", 5)
     defaults = parts
 
     local template_input = trim_string(parts[1])
@@ -952,16 +1207,28 @@ local function prompt_for_settings(current, template_lookup, templates, order)
               0
             )
           else
-            return {
-              template_key = resolved_template_key,
-              template = templates[resolved_template_key],
-              asset_names = asset_names,
-              asset_names_raw = parts[2],
-              insert_mode = insert_mode,
-              include_fx = current.include_fx,
-              apply_colors = current.apply_colors,
-              write_notes = current.write_notes,
-            }
+            local include_buses = parse_boolean(parts[4], nil)
+            local create_markers = parse_boolean(parts[5], nil)
+            if include_buses == nil or create_markers == nil then
+              reaper.ShowMessageBox(
+                "Bus and marker options must be y/n values.",
+                SCRIPT_TITLE,
+                0
+              )
+            else
+              return {
+                template_key = resolved_template_key,
+                template = templates[resolved_template_key],
+                asset_names = asset_names,
+                asset_names_raw = parts[2],
+                insert_mode = insert_mode,
+                include_fx = current.include_fx,
+                apply_colors = current.apply_colors,
+                write_notes = current.write_notes,
+                include_buses = include_buses,
+                create_markers = create_markers,
+              }
+            end
           end
         end
       end
@@ -1036,6 +1303,8 @@ end
 
 local function create_single_template(template, asset_name, insert_index, options, stats)
   local folder_track_name = template.folder.name:gsub("%[AssetName%]", asset_name)
+  local created_layer_tracks = {}
+  local created_bus_tracks = {}
   reaper.InsertTrackAtIndex(insert_index, true)
   local folder_track = reaper.GetTrack(0, insert_index)
   set_track_name(folder_track, folder_track_name)
@@ -1068,6 +1337,10 @@ local function create_single_template(template, asset_name, insert_index, option
     reaper.InsertTrackAtIndex(track_index, true)
     local layer_track = reaper.GetTrack(0, track_index)
     apply_layer_settings(layer_track, layer_definition, options, stats)
+    created_layer_tracks[layer_index] = {
+      track = layer_track,
+      definition = layer_definition,
+    }
 
     if layer_index == #template.layers then
       reaper.SetMediaTrackInfo_Value(layer_track, "I_FOLDERDEPTH", -1)
@@ -1077,13 +1350,58 @@ local function create_single_template(template, asset_name, insert_index, option
     stats.created_tracks = stats.created_tracks + 1
   end
 
-  return insert_index + #template.layers + 1
+  local next_insert_index = insert_index + #template.layers + 1
+
+  if options.include_buses and template.buses then
+    for bus_index, bus_definition in ipairs(template.buses) do
+      local track_index = insert_index + #template.layers + bus_index
+      reaper.InsertTrackAtIndex(track_index, true)
+      local bus_track = reaper.GetTrack(0, track_index)
+      set_track_name(bus_track, build_bus_track_name(bus_definition, asset_name))
+
+      if options.apply_colors then
+        apply_track_color(bus_track, bus_definition.color)
+      end
+      if options.include_fx then
+        for _, fx_definition in ipairs(bus_definition.fx_chain or {}) do
+          insert_fx(bus_track, fx_definition, stats)
+        end
+      end
+      if options.write_notes and bus_definition.note then
+        local note_visible = set_track_note(bus_track, bus_definition.note)
+        stats.note_count = stats.note_count + 1
+        if note_visible then
+          stats.sws_notes_written = stats.sws_notes_written + 1
+        end
+      end
+
+      created_bus_tracks[bus_definition.name] = bus_track
+      stats.created_tracks = stats.created_tracks + 1
+      stats.created_buses = stats.created_buses + 1
+    end
+
+    for _, layer_data in ipairs(created_layer_tracks) do
+      for _, send_definition in ipairs(layer_data.definition.sends or {}) do
+        local bus_track = created_bus_tracks[send_definition.bus]
+        if bus_track then
+          apply_track_send(layer_data.track, send_definition, bus_track, stats)
+        end
+      end
+    end
+
+    next_insert_index = insert_index + #template.layers + #template.buses + 1
+  end
+
+  return next_insert_index
 end
 
 local function create_templates(settings)
   local stats = {
     created_templates = 0,
     created_tracks = 0,
+    created_buses = 0,
+    created_sends = 0,
+    created_markers = 0,
     created_assets = {},
     fx_warnings = 0,
     fx_missing = {},
@@ -1094,13 +1412,17 @@ local function create_templates(settings)
 
   local insert_index, cursor_fallback = resolve_insert_index(settings.insert_mode)
   stats.cursor_fallback_to_end = cursor_fallback
+  local marker_start = reaper.GetCursorPosition()
 
   reaper.Undo_BeginBlock()
   reaper.PreventUIRefresh(1)
 
   local ok, err = pcall(function()
-    for _, asset_name in ipairs(settings.asset_names) do
+    for asset_index, asset_name in ipairs(settings.asset_names) do
       insert_index = create_single_template(settings.template, asset_name, insert_index, settings, stats)
+      if settings.create_markers then
+        create_guide_markers(asset_name, marker_start + ((asset_index - 1) * 15.0), stats)
+      end
     end
   end)
 
@@ -1127,6 +1449,9 @@ local function print_summary(settings, stats)
   log_line(string.format("Insert Mode:    %s", settings.insert_mode))
   log_line(string.format("Created Sets:   %d", stats.created_templates))
   log_line(string.format("Created Tracks: %d", stats.created_tracks))
+  log_line(string.format("Created Buses:  %d", stats.created_buses))
+  log_line(string.format("Created Sends:  %d", stats.created_sends))
+  log_line(string.format("Guide Markers:  %d", stats.created_markers))
   log_line(string.format("Notes Stored:   %d", stats.note_count))
 
   if stats.cursor_fallback_to_end then
@@ -1174,6 +1499,8 @@ local function save_ui_settings(ui)
     include_fx = ui.include_fx,
     apply_colors = ui.apply_colors,
     write_notes = ui.write_notes,
+    include_buses = ui.include_buses,
+    create_markers = ui.create_markers,
   })
 end
 
@@ -1359,6 +1686,10 @@ local function draw_template_preview(template, rect_x, rect_y, rect_w, rect_h)
     line_y = line_y + 18
     draw_text("FX: " .. shorten_text(build_fx_summary(layer_definition), 72), rect_x + 28, line_y, 165, 190, 205, 255, 1, "Consolas", 13)
     line_y = line_y + 18
+    if layer_definition.sends and #layer_definition.sends > 0 then
+      draw_text("Sends: " .. shorten_text(layer_definition.sends[1].bus or "", 72), rect_x + 28, line_y, 175, 185, 150, 255, 1, "Consolas", 13)
+      line_y = line_y + 18
+    end
     if trim_string(layer_definition.note or "") ~= "" then
       draw_text(shorten_text(layer_definition.note, 82), rect_x + 28, line_y, 170, 170, 170, 255, 1, "Segoe UI", 13)
       line_y = line_y + 18
@@ -1369,6 +1700,98 @@ local function draw_template_preview(template, rect_x, rect_y, rect_w, rect_h)
       break
     end
   end
+
+  if template.buses and #template.buses > 0 and line_y <= rect_y + rect_h - 40 then
+    line_y = line_y + 4
+    draw_text("Buses", rect_x + 12, line_y, 220, 220, 220, 255, 1, "Segoe UI Semibold", 15)
+    line_y = line_y + 22
+    for _, bus_definition in ipairs(template.buses) do
+      draw_text("- " .. shorten_text(build_bus_track_name(bus_definition, "Asset"), 60), rect_x + 24, line_y, 180, 200, 220, 255, 1, "Segoe UI", 13)
+      line_y = line_y + 18
+      if line_y > rect_y + rect_h - 22 then
+        break
+      end
+    end
+  end
+end
+
+local function perform_load_assets_from_csv(ui)
+  local ok, file_path = reaper.GetUserFileNameForRead("", "Import Asset Names From CSV", "csv")
+  if not ok or trim_string(file_path) == "" then
+    return
+  end
+
+  local content, err = read_text_file(file_path)
+  if not content then
+    reaper.ShowMessageBox("Failed to read CSV file:\n\n" .. tostring(err), SCRIPT_TITLE, 0)
+    set_status(ui, "CSV import failed.")
+    return
+  end
+
+  local asset_names = parse_csv_asset_text(content)
+  if #asset_names == 0 then
+    reaper.ShowMessageBox("No asset names were found in the selected CSV file.", SCRIPT_TITLE, 0)
+    set_status(ui, "CSV import found no usable asset names.")
+    return
+  end
+
+  ui.asset_names_text = table.concat(asset_names, ", ")
+  save_ui_settings(ui)
+  set_status(ui, string.format("Loaded %d asset name(s) from CSV.", #asset_names))
+end
+
+local function perform_export_selected_custom(ui)
+  local custom_id = get_custom_id_from_runtime_key(ui.selected_template_key)
+  local template = ui.templates[ui.selected_template_key]
+  if not custom_id or not template then
+    set_status(ui, "Select a custom template to export.")
+    return
+  end
+
+  local project_path = reaper.GetProjectPath("")
+  local default_path = project_path .. "/" .. sanitize_asset_name(template.name) .. ".gsltemplate"
+  local ok, csv = reaper.GetUserInputs(
+    SCRIPT_TITLE .. " - Export Custom Template",
+    1,
+    "separator=|,Output File Path",
+    default_path
+  )
+  if not ok then
+    return
+  end
+
+  local output_path = trim_string(csv)
+  if output_path == "" then
+    set_status(ui, "Export cancelled: no output path provided.")
+    return
+  end
+
+  local write_ok, err = export_templates_to_file(output_path, { template })
+  if not write_ok then
+    reaper.ShowMessageBox("Failed to export template:\n\n" .. tostring(err), SCRIPT_TITLE, 0)
+    set_status(ui, "Export failed.")
+    return
+  end
+
+  set_status(ui, "Exported custom template to " .. output_path)
+end
+
+local function perform_import_templates_from_ui(ui)
+  local ok, file_path = reaper.GetUserFileNameForRead("", "Import Custom Template File", "gsltemplate")
+  if not ok or trim_string(file_path) == "" then
+    return
+  end
+
+  local imported_ids, err = import_templates_from_file(file_path)
+  if not imported_ids then
+    reaper.ShowMessageBox("Failed to import template file:\n\n" .. tostring(err), SCRIPT_TITLE, 0)
+    set_status(ui, "Template import failed.")
+    return
+  end
+
+  refresh_gui_templates(ui, "custom::" .. imported_ids[#imported_ids])
+  save_ui_settings(ui)
+  set_status(ui, string.format("Imported %d custom template(s).", #imported_ids))
 end
 
 local function perform_create_from_ui(ui)
@@ -1393,6 +1816,8 @@ local function perform_create_from_ui(ui)
     include_fx = ui.include_fx,
     apply_colors = ui.apply_colors,
     write_notes = ui.write_notes,
+    include_buses = ui.include_buses,
+    create_markers = ui.create_markers,
   }
 
   save_ui_settings(ui)
@@ -1493,6 +1918,8 @@ local function run_prompt_flow(current_settings)
     include_fx = settings.include_fx,
     apply_colors = settings.apply_colors,
     write_notes = settings.write_notes,
+    include_buses = settings.include_buses,
+    create_markers = settings.create_markers,
   })
 
   local ok, result = create_templates(settings)
@@ -1513,13 +1940,15 @@ local function run_gfx_ui(current_settings)
 
   local ui = {
     width = 980,
-    height = 720,
+    height = 860,
     selected_template_key = current_settings.template_key,
     asset_names_text = current_settings.asset_names or DEFAULTS.asset_names,
     insert_mode = current_settings.insert_mode or DEFAULTS.insert_mode,
     include_fx = current_settings.include_fx,
     apply_colors = current_settings.apply_colors,
     write_notes = current_settings.write_notes,
+    include_buses = current_settings.include_buses,
+    create_markers = current_settings.create_markers,
     mouse_x = 0,
     mouse_y = 0,
     mouse_down = false,
@@ -1558,12 +1987,12 @@ local function run_gfx_ui(current_settings)
 
     draw_rect(0, 0, ui.width, ui.height, true, 16, 18, 22, 255)
     draw_text(SCRIPT_TITLE, 24, 18, 245, 245, 245, 255, 1, "Segoe UI Semibold", 22)
-    draw_text("Phase 2: built-in + custom templates, batch asset creation, gfx UI", 24, 48, 150, 170, 185, 255, 1, "Segoe UI", 13)
+    draw_text("Phase 3: buses, sends, guide markers, CSV import, custom export/import", 24, 48, 150, 170, 185, 255, 1, "Segoe UI", 13)
 
-    draw_rect(20, 82, 420, 610, true, 24, 24, 24, 255)
-    draw_rect(20, 82, 420, 610, false, 58, 58, 58, 255)
-    draw_rect(460, 82, 500, 610, true, 24, 24, 24, 255)
-    draw_rect(460, 82, 500, 610, false, 58, 58, 58, 255)
+    draw_rect(20, 82, 420, 750, true, 24, 24, 24, 255)
+    draw_rect(20, 82, 420, 750, false, 58, 58, 58, 255)
+    draw_rect(460, 82, 500, 750, true, 24, 24, 24, 255)
+    draw_rect(460, 82, 500, 750, false, 58, 58, 58, 255)
 
     draw_text("Template", 40, 102, 235, 235, 235, 255, 1, "Segoe UI Semibold", 16)
     local selected_template = ui.templates[ui.selected_template_key]
@@ -1574,43 +2003,54 @@ local function run_gfx_ui(current_settings)
     draw_text(selected_template and selected_template.description or "", 40, 176, 170, 170, 170, 255, 1, "Segoe UI", 13)
 
     ui.asset_names_text = draw_text_input(ui, "asset_names", "Asset Name(s) - comma separated", 40, 230, 360, 34, ui.asset_names_text)
+    if draw_button(ui, "load_csv", "Load Asset Names From CSV", 40, 276, 220, 32, true) then
+      perform_load_assets_from_csv(ui)
+    end
 
-    draw_text("Insert Position", 40, 286, 235, 235, 235, 255, 1, "Segoe UI Semibold", 15)
-    ui.insert_mode = draw_radio(ui, "insert_end", "End of project", 40, 314, ui.insert_mode, "end")
-    ui.insert_mode = draw_radio(ui, "insert_cursor", "After selected track", 210, 314, ui.insert_mode, "cursor")
+    draw_text("Insert Position", 40, 332, 235, 235, 235, 255, 1, "Segoe UI Semibold", 15)
+    ui.insert_mode = draw_radio(ui, "insert_end", "End of project", 40, 360, ui.insert_mode, "end")
+    ui.insert_mode = draw_radio(ui, "insert_cursor", "After selected track", 210, 360, ui.insert_mode, "cursor")
 
-    draw_text("Options", 40, 362, 235, 235, 235, 255, 1, "Segoe UI Semibold", 15)
-    ui.include_fx = draw_checkbox(ui, "include_fx", "Include FX chains", 40, 392, ui.include_fx)
-    ui.apply_colors = draw_checkbox(ui, "apply_colors", "Apply track colors", 40, 422, ui.apply_colors)
-    ui.write_notes = draw_checkbox(ui, "write_notes", "Store track notes", 40, 452, ui.write_notes)
+    draw_text("Options", 40, 410, 235, 235, 235, 255, 1, "Segoe UI Semibold", 15)
+    ui.include_fx = draw_checkbox(ui, "include_fx", "Include FX chains", 40, 440, ui.include_fx)
+    ui.apply_colors = draw_checkbox(ui, "apply_colors", "Apply track colors", 40, 470, ui.apply_colors)
+    ui.write_notes = draw_checkbox(ui, "write_notes", "Store track notes", 40, 500, ui.write_notes)
+    ui.include_buses = draw_checkbox(ui, "include_buses", "Include bus tracks and sends", 40, 530, ui.include_buses)
+    ui.create_markers = draw_checkbox(ui, "create_markers", "Create guide markers", 40, 560, ui.create_markers)
 
-    draw_text("Custom Templates", 40, 506, 235, 235, 235, 255, 1, "Segoe UI Semibold", 15)
-    if draw_button(ui, "capture_custom", "Capture Selection", 40, 536, 170, 34, true) then
+    draw_text("Custom Templates", 40, 614, 235, 235, 235, 255, 1, "Segoe UI Semibold", 15)
+    if draw_button(ui, "capture_custom", "Capture Selection", 40, 644, 170, 34, true) then
       perform_capture_from_ui(ui)
     end
-    if draw_button(ui, "delete_custom", "Delete Selected Custom", 220, 536, 180, 34, is_custom_runtime_key(ui.selected_template_key)) then
+    if draw_button(ui, "delete_custom", "Delete Selected Custom", 220, 644, 180, 34, is_custom_runtime_key(ui.selected_template_key)) then
       perform_delete_selected_custom(ui)
     end
-    if draw_button(ui, "refresh_custom", "Refresh List", 40, 580, 120, 32, true) then
+    if draw_button(ui, "export_custom", "Export Selected", 40, 688, 170, 32, is_custom_runtime_key(ui.selected_template_key)) then
+      perform_export_selected_custom(ui)
+    end
+    if draw_button(ui, "import_custom", "Import Template File", 220, 688, 180, 32, true) then
+      perform_import_templates_from_ui(ui)
+    end
+    if draw_button(ui, "refresh_custom", "Refresh List", 40, 730, 120, 32, true) then
       refresh_gui_templates(ui)
       set_status(ui, "Template list refreshed.")
     end
 
-    if draw_button(ui, "create", "Create Template", 40, 640, 190, 36, true) then
+    if draw_button(ui, "create", "Create Template", 40, 780, 190, 36, true) then
       perform_create_from_ui(ui)
     end
-    if draw_button(ui, "close", "Close", 250, 640, 100, 36, true) then
+    if draw_button(ui, "close", "Close", 250, 780, 100, 36, true) then
       save_ui_settings(ui)
       gfx.quit()
       return
     end
 
     if selected_template then
-      draw_template_preview(selected_template, 480, 102, 460, 520)
+      draw_template_preview(selected_template, 480, 102, 460, 650)
       draw_text(
         is_custom_runtime_key(ui.selected_template_key) and "Type: Custom template" or "Type: Built-in template",
         480,
-        638,
+        772,
         180,
         200,
         180,
@@ -1621,8 +2061,8 @@ local function run_gfx_ui(current_settings)
       )
     end
 
-    draw_rect(20, 686, 940, 1, true, 48, 48, 48, 255)
-    draw_text(shorten_text(ui.status_message, 120), 24, 696, 170, 205, 220, 255, 1, "Segoe UI", 13)
+    draw_rect(20, 838, 940, 1, true, 48, 48, 48, 255)
+    draw_text(shorten_text(ui.status_message, 120), 24, 846, 170, 205, 220, 255, 1, "Segoe UI", 13)
 
     if key == 27 and not ui.consume_escape and ui.focus_field == nil then
       save_ui_settings(ui)

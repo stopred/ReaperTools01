@@ -32,11 +32,13 @@ local DEFAULTS = {
   normalize_mode = "off",
   normalize_target_db = -1.0,
   max_gain_db = 20.0,
+  category_rules_text = "SFX_Weapon=peak:-1;SFX_Footstep=peak:-6;UI=peak:-3;AMB=rms:-24",
   clip_protect = true,
   dry_run = false,
   min_length_ms = 50.0,
   max_trim_ratio = 90.0,
   sync_regions = true,
+  create_markers = false,
 }
 
 local HUMAN_TAIL_MODE = {
@@ -49,6 +51,7 @@ local HUMAN_NORMALIZE_MODE = {
   off = "Off",
   peak = "Peak",
   rms = "RMS",
+  category = "Category",
 }
 
 local HUMAN_FADE_CURVE = {
@@ -115,6 +118,24 @@ local function round_to(value, decimals)
     return math.floor(value * power + 0.5) / power
   end
   return math.ceil(value * power - 0.5) / power
+end
+
+local function clamp_number(value, min_value, max_value)
+  if value < min_value then
+    return min_value
+  end
+  if value > max_value then
+    return max_value
+  end
+  return value
+end
+
+local function clone_table(source)
+  local target = {}
+  for key, value in pairs(source or {}) do
+    target[key] = value
+  end
+  return target
 end
 
 local function log10(value)
@@ -201,6 +222,9 @@ local function parse_normalize_mode(value)
   if lowered == "rms" then
     return "rms"
   end
+  if lowered == "category" or lowered == "cat" or lowered == "preset" then
+    return "category"
+  end
   return nil
 end
 
@@ -216,6 +240,55 @@ local function parse_fade_curve(value)
     return "scurve"
   end
   return nil
+end
+
+local function parse_category_rules(text)
+  local rules = {}
+  local errors = {}
+  local source_text = tostring(text or "")
+
+  for raw_entry in source_text:gmatch("[^;\r\n]+") do
+    local entry = trim_string(raw_entry)
+    if entry ~= "" then
+      local key_part, value_part = entry:match("^([^=]+)=(.+)$")
+      if not key_part or not value_part then
+        errors[#errors + 1] = entry
+      else
+        local mode_part, target_part = value_part:match("^([^:]+):(.+)$")
+        local key = trim_string(key_part)
+        local mode = parse_normalize_mode(mode_part)
+        local target = tonumber(trim_string(target_part))
+
+        if key == "" or not mode or mode == "off" or mode == "category" or not target then
+          errors[#errors + 1] = entry
+        else
+          rules[#rules + 1] = {
+            key = key,
+            match_upper = key:upper(),
+            mode = mode,
+            target_db = target,
+          }
+        end
+      end
+    end
+  end
+
+  if #errors > 0 then
+    return nil, "Invalid category rule entries: " .. table.concat(errors, "; ")
+  end
+
+  return rules
+end
+
+local function normalize_category_text(text)
+  local entries = {}
+  for raw_entry in tostring(text or ""):gmatch("[^;\r\n]+") do
+    local entry = trim_string(raw_entry)
+    if entry ~= "" then
+      entries[#entries + 1] = entry
+    end
+  end
+  return table.concat(entries, ";")
 end
 
 local function load_settings()
@@ -236,11 +309,18 @@ local function load_settings()
   settings.normalize_mode = parse_normalize_mode(get_ext_state("normalize_mode", DEFAULTS.normalize_mode)) or DEFAULTS.normalize_mode
   settings.normalize_target_db = tonumber(get_ext_state("normalize_target_db", tostring(DEFAULTS.normalize_target_db))) or DEFAULTS.normalize_target_db
   settings.max_gain_db = tonumber(get_ext_state("max_gain_db", tostring(DEFAULTS.max_gain_db))) or DEFAULTS.max_gain_db
+  settings.category_rules_text = normalize_category_text(get_ext_state("category_rules_text", DEFAULTS.category_rules_text))
+  settings.category_rules = parse_category_rules(settings.category_rules_text)
+  if not settings.category_rules then
+    settings.category_rules_text = DEFAULTS.category_rules_text
+    settings.category_rules = parse_category_rules(settings.category_rules_text) or {}
+  end
   settings.clip_protect = parse_boolean(get_ext_state("clip_protect", bool_to_string(DEFAULTS.clip_protect)), DEFAULTS.clip_protect)
   settings.dry_run = parse_boolean(get_ext_state("dry_run", bool_to_string(DEFAULTS.dry_run)), DEFAULTS.dry_run)
   settings.min_length_ms = tonumber(get_ext_state("min_length_ms", tostring(DEFAULTS.min_length_ms))) or DEFAULTS.min_length_ms
   settings.max_trim_ratio = tonumber(get_ext_state("max_trim_ratio", tostring(DEFAULTS.max_trim_ratio))) or DEFAULTS.max_trim_ratio
   settings.sync_regions = parse_boolean(get_ext_state("sync_regions", bool_to_string(DEFAULTS.sync_regions)), DEFAULTS.sync_regions)
+  settings.create_markers = parse_boolean(get_ext_state("create_markers", bool_to_string(DEFAULTS.create_markers)), DEFAULTS.create_markers)
 
   return settings
 end
@@ -261,11 +341,13 @@ local function save_settings(settings)
   reaper.SetExtState(EXT_SECTION, "normalize_mode", tostring(settings.normalize_mode), true)
   reaper.SetExtState(EXT_SECTION, "normalize_target_db", tostring(settings.normalize_target_db), true)
   reaper.SetExtState(EXT_SECTION, "max_gain_db", tostring(settings.max_gain_db), true)
+  reaper.SetExtState(EXT_SECTION, "category_rules_text", tostring(settings.category_rules_text or DEFAULTS.category_rules_text), true)
   reaper.SetExtState(EXT_SECTION, "clip_protect", bool_to_string(settings.clip_protect), true)
   reaper.SetExtState(EXT_SECTION, "dry_run", bool_to_string(settings.dry_run), true)
   reaper.SetExtState(EXT_SECTION, "min_length_ms", tostring(settings.min_length_ms), true)
   reaper.SetExtState(EXT_SECTION, "max_trim_ratio", tostring(settings.max_trim_ratio), true)
   reaper.SetExtState(EXT_SECTION, "sync_regions", bool_to_string(settings.sync_regions), true)
+  reaper.SetExtState(EXT_SECTION, "create_markers", bool_to_string(settings.create_markers), true)
 end
 
 local function prompt_for_settings(current)
@@ -284,7 +366,7 @@ local function prompt_for_settings(current)
     "Fade Out Length (ms)",
     "Fade Curve (lin/exp/scurve)",
     "Target Length (sec, 0=off)",
-    "Normalize Mode (off/peak/rms)",
+    "Normalize Mode (off/peak/rms/category)",
     "Normalize Target (dB)",
     "Max Gain (dB)",
     "Protect From Clipping (y/n)",
@@ -292,6 +374,7 @@ local function prompt_for_settings(current)
     "Min Item Length (ms)",
     "Max Trim Ratio (%)",
     "Sync Matching Regions (y/n)",
+    "Create Before/After Markers (y/n)",
   }, ",")
 
   local defaults = table.concat({
@@ -315,14 +398,15 @@ local function prompt_for_settings(current)
     tostring(current.min_length_ms),
     tostring(current.max_trim_ratio),
     bool_to_string(current.sync_regions),
+    bool_to_string(current.create_markers),
   }, "|")
 
-  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE, 20, captions, defaults)
+  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE, 21, captions, defaults)
   if not ok then
     return nil, "User cancelled."
   end
 
-  local parts = split_delimited(values, "|", 20)
+  local parts = split_delimited(values, "|", 21)
   local settings = {}
 
   settings.threshold_db = tonumber(parts[1])
@@ -345,6 +429,7 @@ local function prompt_for_settings(current)
   settings.min_length_ms = tonumber(parts[18])
   settings.max_trim_ratio = tonumber(parts[19])
   settings.sync_regions = parse_boolean(parts[20], nil)
+  settings.create_markers = parse_boolean(parts[21], nil)
 
   if not settings.threshold_db or settings.threshold_db > 0 or settings.threshold_db < -150 then
     return nil, "Threshold must be between -150 and 0 dB."
@@ -406,6 +491,9 @@ local function prompt_for_settings(current)
   if settings.sync_regions == nil then
     return nil, "Sync Matching Regions must be y or n."
   end
+  if settings.create_markers == nil then
+    return nil, "Create Before/After Markers must be y or n."
+  end
   if settings.tail_mode == "target" and settings.target_length_sec <= 0 then
     return nil, "Target mode requires Target Length greater than 0."
   end
@@ -421,6 +509,8 @@ local function prompt_for_settings(current)
   settings.max_gain_db = round_to(settings.max_gain_db, 3)
   settings.min_length_ms = round_to(settings.min_length_ms, 3)
   settings.max_trim_ratio = round_to(settings.max_trim_ratio, 3)
+  settings.category_rules_text = current.category_rules_text or DEFAULTS.category_rules_text
+  settings.category_rules = current.category_rules or {}
 
   return settings
 end
@@ -456,40 +546,52 @@ end
 
 local function collect_matching_regions(project, start_pos, end_pos)
   local matches = {}
-  local count = reaper.GetNumRegionsOrMarkers(project)
+  local names = {}
+  local index = 0
 
-  for index = 0, count - 1 do
-    local region = reaper.GetRegionOrMarker(project, index, "")
-    if region then
-      local is_region = reaper.GetRegionOrMarkerInfo_Value(project, region, "B_ISREGION")
-      if is_region > 0.5 then
-        local region_start = reaper.GetRegionOrMarkerInfo_Value(project, region, "D_STARTPOS")
-        local region_end = reaper.GetRegionOrMarkerInfo_Value(project, region, "D_ENDPOS")
-        if math.abs(region_start - start_pos) <= REGION_MATCH_TOLERANCE_SEC
-          and math.abs(region_end - end_pos) <= REGION_MATCH_TOLERANCE_SEC then
-          matches[#matches + 1] = region
-        end
-      end
+  while true do
+    local retval, is_region, region_start, region_end, region_name, region_id, region_color =
+      reaper.EnumProjectMarkers3(project, index)
+    if retval == 0 then
+      break
     end
+
+    if is_region
+      and math.abs(region_start - start_pos) <= REGION_MATCH_TOLERANCE_SEC
+      and math.abs(region_end - end_pos) <= REGION_MATCH_TOLERANCE_SEC then
+      local clean_name = trim_string(region_name)
+      matches[#matches + 1] = {
+        id = region_id,
+        name = clean_name,
+        color = region_color or 0,
+      }
+      names[#names + 1] = clean_name
+    end
+
+    index = index + 1
   end
 
-  return matches
+  return matches, names
 end
 
 local function analyze_item(item, index, settings)
   local take = reaper.GetActiveTake(item)
+  local track = reaper.GetMediaItemTrack(item)
   local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
   local item_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
   local project = reaper.GetItemProjectContext(item)
+  local _, track_name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
 
   local result = {
     item = item,
     take = take,
+    track = track,
     item_index = index,
     item_position = item_pos,
     item_end = item_pos + item_length,
     total_length = item_length,
     take_name = get_take_name_or_fallback(take, index),
+    track_name = trim_string(track_name),
     valid = false,
     is_silent = false,
     head_silence = 0.0,
@@ -500,6 +602,7 @@ local function analyze_item(item, index, settings)
     rms_db = NEG_INF_DB,
     warnings = {},
     region_matches = {},
+    region_names = {},
   }
 
   if not take then
@@ -535,9 +638,7 @@ local function analyze_item(item, index, settings)
     return result
   end
 
-  if settings.sync_regions then
-    result.region_matches = collect_matching_regions(project, item_pos, item_pos + item_length)
-  end
+  result.region_matches, result.region_names = collect_matching_regions(project, item_pos, item_pos + item_length)
 
   local block_size = math.max(64, math.floor(settings.block_size))
   local threshold_linear = db_to_linear(settings.threshold_db)
@@ -867,11 +968,32 @@ local function build_item_plan(analysis, settings)
   end
 
   if settings.normalize_mode ~= "off" then
-    local current_level = settings.normalize_mode == "peak" and analysis.peak_db or analysis.rms_db
+    local normalize_mode = settings.normalize_mode
+    local normalize_target = settings.normalize_target_db
+    local normalize_label = HUMAN_NORMALIZE_MODE[normalize_mode] or normalize_mode
+    local category_rule = nil
+    local category_source = nil
+
+    if normalize_mode == "category" then
+      category_rule, category_source = find_category_rule_for_analysis(analysis, settings)
+      if not category_rule then
+        plan.warnings[#plan.warnings + 1] = "Category normalize skipped: no matching preset for track/region."
+        category_source = nil
+        normalize_mode = "off"
+      else
+        normalize_mode = category_rule.mode
+        normalize_target = category_rule.target_db
+        normalize_label = string.format("Category(%s)", category_rule.key)
+        plan.category_rule_key = category_rule.key
+        plan.category_source_name = category_source
+      end
+    end
+
+    local current_level = normalize_mode == "peak" and analysis.peak_db or analysis.rms_db
     if current_level <= NEG_INF_DB + 0.5 then
       plan.warnings[#plan.warnings + 1] = "Normalize skipped: level is too low to measure."
-    else
-      local gain_db = settings.normalize_target_db - current_level
+    elseif normalize_mode ~= "off" then
+      local gain_db = normalize_target - current_level
       gain_db = math.min(gain_db, settings.max_gain_db)
 
       if settings.clip_protect then
@@ -885,10 +1007,20 @@ local function build_item_plan(analysis, settings)
       if math.abs(gain_db) > 0.001 then
         plan.gain_db = gain_db
         plan.gain_linear = db_to_linear(gain_db)
+        plan.normalize_mode_applied = normalize_mode
+        plan.normalize_target_applied = normalize_target
         plan.messages[#plan.messages + 1] = string.format(
           "Normalize %s %+.2f dB",
-          HUMAN_NORMALIZE_MODE[settings.normalize_mode] or settings.normalize_mode,
+          normalize_label,
           gain_db
+        )
+      elseif category_rule and category_source then
+        plan.normalize_mode_applied = normalize_mode
+        plan.normalize_target_applied = normalize_target
+        plan.warnings[#plan.warnings + 1] = string.format(
+          "Category preset %s matched %s, but no gain change was needed.",
+          category_rule.key,
+          category_source
         )
       end
     end
@@ -898,6 +1030,76 @@ local function build_item_plan(analysis, settings)
   plan.new_offset = current_offset
   plan.new_length = current_length
   return plan
+end
+
+local function analyze_items(items, settings)
+  local analyses = {}
+  for index, item in ipairs(items or {}) do
+    analyses[#analyses + 1] = analyze_item(item, index, settings)
+  end
+  return analyses
+end
+
+local function build_plans_from_analyses(analyses, settings)
+  local plans = {}
+  for _, analysis in ipairs(analyses or {}) do
+    plans[#plans + 1] = build_item_plan(analysis, settings)
+  end
+  return plans
+end
+
+local function find_category_rule_for_analysis(analysis, settings)
+  local rules = settings.category_rules or {}
+  if #rules == 0 then
+    return nil, nil
+  end
+
+  local candidates = {}
+  if trim_string(analysis.track_name) ~= "" then
+    candidates[#candidates + 1] = trim_string(analysis.track_name)
+  end
+  for _, region_name in ipairs(analysis.region_names or {}) do
+    if trim_string(region_name) ~= "" then
+      candidates[#candidates + 1] = trim_string(region_name)
+    end
+  end
+
+  for _, rule in ipairs(rules) do
+    for _, candidate in ipairs(candidates) do
+      if candidate:upper():find(rule.match_upper, 1, true) == 1 then
+        return rule, candidate
+      end
+    end
+  end
+
+  return nil, candidates[1]
+end
+
+local function summarize_plan(plan)
+  if not plan then
+    return ""
+  end
+  if plan.skip then
+    return "Skip"
+  end
+
+  local parts = {}
+  if plan.head_trim_amount > 0.0 then
+    parts[#parts + 1] = "Head"
+  end
+  if plan.new_length < plan.analysis.total_length - 1e-9 then
+    parts[#parts + 1] = "Trim"
+  end
+  if plan.fade_length_sec > 0.0 then
+    parts[#parts + 1] = "Fade"
+  end
+  if math.abs(plan.gain_db or 0.0) > 0.001 then
+    parts[#parts + 1] = string.format("%+.1fdB", plan.gain_db)
+  end
+  if #parts == 0 then
+    return "No change"
+  end
+  return table.concat(parts, " | ")
 end
 
 local function print_analysis_report(analyses, settings)
@@ -1039,10 +1241,13 @@ local function update_matching_regions(plan)
   local new_end = plan.new_position + plan.new_length
   local updated = 0
 
-  for _, region in ipairs(plan.region_matches) do
-    if region and reaper.GetRegionOrMarkerInfo_Value(project, region, "B_ISREGION") > 0.5 then
-      reaper.SetRegionOrMarkerInfo_Value(project, region, "D_STARTPOS", new_start)
-      reaper.SetRegionOrMarkerInfo_Value(project, region, "D_ENDPOS", new_end)
+  for _, region_info in ipairs(plan.region_matches) do
+    if region_info and region_info.id then
+      if reaper.SetProjectMarker3 then
+        reaper.SetProjectMarker3(project, region_info.id, true, new_start, new_end, region_info.name or "", region_info.color or 0)
+      else
+        reaper.SetProjectMarker(region_info.id, true, new_start, new_end, region_info.name or "")
+      end
       updated = updated + 1
     end
   end
@@ -1093,6 +1298,7 @@ local function process_plans(plans, selected_items, settings)
   local processed_count = 0
   local skipped_count = 0
   local updated_regions = 0
+  local created_markers = 0
 
   if settings.dry_run then
     return true, {
@@ -1110,6 +1316,9 @@ local function process_plans(plans, selected_items, settings)
       if plan.skip then
         skipped_count = skipped_count + 1
       else
+        if settings.create_markers then
+          created_markers = created_markers + add_before_after_markers(plan)
+        end
         local applied, region_updates, apply_err = apply_item_plan(plan, settings)
         if not applied then
           error(apply_err or "Failed to apply item plan.")
@@ -1131,6 +1340,7 @@ local function process_plans(plans, selected_items, settings)
       processed_count = processed_count,
       skipped_count = skipped_count,
       updated_regions = updated_regions,
+      created_markers = created_markers,
     }
   end
 
@@ -1170,54 +1380,679 @@ local function print_final_summary(plans, settings, process_result)
   if not settings.dry_run and process_result then
     log_line(string.format("  Applied items:         %d", process_result.processed_count or 0))
     log_line(string.format("  Synced regions:        %d", process_result.updated_regions or 0))
+    log_line(string.format("  Created markers:       %d", process_result.created_markers or 0))
   end
 
   log_line("==========================================================================")
 end
 
-local function main()
-  local selected_items = collect_selected_items()
-  if #selected_items == 0 then
-    reaper.ShowMessageBox("No selected media items were found.", SCRIPT_TITLE, 0)
+local function csv_escape(value)
+  local text = tostring(value or "")
+  if text:find('[,"\r\n]') then
+    return '"' .. text:gsub('"', '""') .. '"'
+  end
+  return text
+end
+
+local function ensure_directory(path)
+  if trim_string(path) == "" then
+    return false
+  end
+  reaper.RecursiveCreateDirectory(path, 0)
+  return true
+end
+
+local function get_export_csv_path()
+  local project_path = reaper.GetProjectPath("")
+  local analysis_dir = project_path .. "/Analysis"
+  ensure_directory(analysis_dir)
+  local timestamp = os.date("%Y%m%d_%H%M%S")
+  return analysis_dir .. "/tail_analysis_" .. timestamp .. ".csv"
+end
+
+local function export_analysis_csv(analyses, plans, settings)
+  local output_path = get_export_csv_path()
+  local handle, err = io.open(output_path, "w")
+  if not handle then
+    return false, err or "Failed to open CSV for writing."
+  end
+
+  local headers = {
+    "index", "take_name", "track_name", "region_names", "total_length_sec", "head_silence_sec",
+    "tail_silence_sec", "content_start_sec", "content_end_sec", "peak_db", "rms_db",
+    "status", "plan_summary", "new_position_sec", "new_length_sec", "new_offset_sec",
+    "gain_db", "normalize_mode", "normalize_target_db",
+  }
+  handle:write(table.concat(headers, ",") .. "\n")
+
+  for index, analysis in ipairs(analyses or {}) do
+    local plan = plans[index]
+    local status = (not analysis.valid and "ERROR") or (analysis.is_silent and "SILENT") or "OK"
+    local row = {
+      analysis.item_index,
+      analysis.take_name,
+      analysis.track_name,
+      table.concat(analysis.region_names or {}, "|"),
+      string.format("%.6f", analysis.total_length or 0.0),
+      string.format("%.6f", analysis.head_silence or 0.0),
+      string.format("%.6f", analysis.tail_silence or 0.0),
+      string.format("%.6f", analysis.content_start or 0.0),
+      string.format("%.6f", analysis.content_end or 0.0),
+      string.format("%.3f", analysis.peak_db or NEG_INF_DB),
+      string.format("%.3f", analysis.rms_db or NEG_INF_DB),
+      status,
+      summarize_plan(plan),
+      string.format("%.6f", plan and plan.new_position or 0.0),
+      string.format("%.6f", plan and plan.new_length or 0.0),
+      string.format("%.6f", plan and plan.new_offset or 0.0),
+      string.format("%.3f", plan and plan.gain_db or 0.0),
+      tostring(plan and plan.normalize_mode_applied or settings.normalize_mode),
+      string.format("%.3f", plan and plan.normalize_target_applied or settings.normalize_target_db),
+    }
+
+    for cell_index, value in ipairs(row) do
+      row[cell_index] = csv_escape(value)
+    end
+    handle:write(table.concat(row, ",") .. "\n")
+  end
+
+  handle:close()
+  return true, output_path
+end
+
+local function add_before_after_markers(plan)
+  if not plan or plan.skip then
+    return 0
+  end
+
+  local before_end = plan.analysis.item_position + plan.analysis.total_length
+  local after_end = plan.new_position + plan.new_length
+  local base_name = truncate_text(plan.analysis.take_name, 48)
+  local created = 0
+
+  if reaper.AddProjectMarker2 then
+    reaper.AddProjectMarker2(0, false, before_end, 0, "Before:" .. base_name, -1, 0)
+    reaper.AddProjectMarker2(0, false, after_end, 0, "After:" .. base_name, -1, 0)
+    created = 2
+  else
+    reaper.AddProjectMarker(false, before_end, 0, "Before:" .. base_name, -1)
+    reaper.AddProjectMarker(false, after_end, 0, "After:" .. base_name, -1)
+    created = 2
+  end
+
+  return created
+end
+
+local GUI = {
+  width = 1120,
+  height = 1020,
+  padding = 16,
+  section_gap = 12,
+  row_h = 26,
+  table_row_h = 22,
+}
+
+local function set_color(r, g, b, a)
+  gfx.set((r or 255) / 255.0, (g or 255) / 255.0, (b or 255) / 255.0, (a or 255) / 255.0)
+end
+
+local function point_in_rect(mx, my, x, y, w, h)
+  return mx >= x and mx <= x + w and my >= y and my <= y + h
+end
+
+local function begin_gui_frame(state)
+  local mouse_down = (gfx.mouse_cap & 1) == 1
+  state.mouse_x = gfx.mouse_x
+  state.mouse_y = gfx.mouse_y
+  state.mouse_down = mouse_down
+  state.mouse_pressed = mouse_down and not state.prev_mouse_down
+  state.mouse_released = (not mouse_down) and state.prev_mouse_down
+  state.prev_mouse_down = mouse_down
+  state.mouse_consumed = false
+  state.wheel_delta = gfx.mouse_wheel - (state.prev_mouse_wheel or gfx.mouse_wheel)
+  state.prev_mouse_wheel = gfx.mouse_wheel
+end
+
+local function finish_gui_frame()
+  gfx.update()
+end
+
+local function draw_text(x, y, text, r, g, b, a)
+  set_color(r, g, b, a)
+  gfx.x = x
+  gfx.y = y
+  gfx.drawstr(tostring(text or ""))
+end
+
+local function draw_panel(x, y, w, h, title)
+  set_color(28, 31, 36, 255)
+  gfx.rect(x, y, w, h, true)
+  set_color(60, 66, 74, 255)
+  gfx.rect(x, y, w, h, false)
+  if title and title ~= "" then
+    gfx.setfont(1, "Arial", 17)
+    draw_text(x + 10, y + 8, title, 230, 234, 240, 255)
+  end
+end
+
+local function draw_button(state, x, y, w, h, label, options)
+  options = options or {}
+  local hovered = point_in_rect(state.mouse_x, state.mouse_y, x, y, w, h)
+  local enabled = options.enabled ~= false
+  local active = options.active == true
+  local bg = { 58, 96, 156, 255 }
+  local border = { 88, 130, 200, 255 }
+  local fg = { 245, 247, 250, 255 }
+
+  if not enabled then
+    bg = { 52, 54, 58, 255 }
+    border = { 72, 74, 78, 255 }
+    fg = { 138, 141, 147, 255 }
+  elseif active then
+    bg = { 86, 122, 58, 255 }
+    border = { 122, 170, 82, 255 }
+  elseif hovered then
+    bg = { 72, 110, 172, 255 }
+  end
+
+  set_color(bg[1], bg[2], bg[3], bg[4])
+  gfx.rect(x, y, w, h, true)
+  set_color(border[1], border[2], border[3], border[4])
+  gfx.rect(x, y, w, h, false)
+
+  gfx.setfont(1, "Arial", 15)
+  local text_w, text_h = gfx.measurestr(label)
+  draw_text(x + (w - text_w) * 0.5, y + (h - text_h) * 0.5, label, fg[1], fg[2], fg[3], fg[4])
+
+  local clicked = enabled and hovered and state.mouse_released and not state.mouse_consumed
+  if clicked then
+    state.mouse_consumed = true
+  end
+  return clicked, hovered
+end
+
+local function draw_value_button(state, x, y, w, h, label, value, enabled)
+  gfx.setfont(1, "Arial", 14)
+  draw_text(x, y + 4, label, 200, 206, 214, 255)
+  local clicked = draw_button(state, x + 150, y, w - 150, h, value, { enabled = enabled }) and true or false
+  return clicked
+end
+
+local function set_status(state, message)
+  state.status_message = message
+end
+
+local function refresh_plan_cache(state)
+  if #state.analyses > 0 and not state.analysis_dirty then
+    state.plans = build_plans_from_analyses(state.analyses, state.settings)
+    state.process_dirty = false
+  end
+end
+
+local function update_setting(state, key, value, analysis_affects)
+  state.settings[key] = value
+  if analysis_affects then
+    state.analysis_dirty = true
+    state.process_dirty = true
+  else
+    state.process_dirty = true
+  end
+  save_settings(state.settings)
+  refresh_plan_cache(state)
+end
+
+local function prompt_numeric_setting(state, key, label, analysis_affects, minimum, maximum, decimals, integer_only)
+  local ok, csv = reaper.GetUserInputs(SCRIPT_TITLE .. " - " .. label, 1, label, tostring(state.settings[key]))
+  if not ok then
     return
   end
 
-  local current_settings = load_settings()
-  local settings, prompt_err = prompt_for_settings(current_settings)
+  local value = tonumber(csv)
+  if not value then
+    reaper.ShowMessageBox(label .. " must be numeric.", SCRIPT_TITLE, 0)
+    return
+  end
+  if integer_only then
+    value = math.floor(value + 0.5)
+  else
+    value = round_to(value, decimals or 3)
+  end
+  if value < minimum or value > maximum then
+    reaper.ShowMessageBox(
+      string.format("%s must be between %s and %s.", label, tostring(minimum), tostring(maximum)),
+      SCRIPT_TITLE,
+      0
+    )
+    return
+  end
+
+  update_setting(state, key, value, analysis_affects)
+  set_status(state, label .. " updated.")
+end
+
+local function adopt_prompt_settings(state)
+  local settings, err = prompt_for_settings(state.settings)
   if not settings then
-    if prompt_err ~= "User cancelled." then
-      reaper.ShowMessageBox(prompt_err or "Invalid settings.", SCRIPT_TITLE, 0)
+    if err and err ~= "User cancelled." then
+      reaper.ShowMessageBox(err, SCRIPT_TITLE, 0)
     end
     return
   end
 
-  save_settings(settings)
+  state.settings = settings
+  state.analysis_dirty = true
+  state.process_dirty = true
+  save_settings(state.settings)
+  set_status(state, "Settings updated from quick dialog.")
+end
 
-  local analyses = {}
+local function prompt_category_rules(state)
+  local ok, csv = reaper.GetUserInputs(
+    SCRIPT_TITLE .. " - Category Rules",
+    1,
+    "extrawidth=640,Rules (Category=mode:target; Category2=mode:target)",
+    tostring(state.settings.category_rules_text or DEFAULTS.category_rules_text)
+  )
+  if not ok then
+    return
+  end
+
+  local normalized = normalize_category_text(csv)
+  local parsed, err = parse_category_rules(normalized)
+  if not parsed then
+    reaper.ShowMessageBox(err or "Invalid category rules.", SCRIPT_TITLE, 0)
+    return
+  end
+
+  state.settings.category_rules_text = normalized
+  state.settings.category_rules = parsed
+  state.process_dirty = true
+  save_settings(state.settings)
+  refresh_plan_cache(state)
+  set_status(state, string.format("Category rules updated (%d presets).", #parsed))
+end
+
+local function run_export_action(state)
+  if state.analysis_dirty or #state.analyses == 0 then
+    if not run_analysis_pass(state) then
+      return
+    end
+  end
+  if state.process_dirty then
+    state.plans = build_plans_from_analyses(state.analyses, state.settings)
+    state.process_dirty = false
+  end
+
   reaper.ClearConsole()
+  print_analysis_report(state.analyses, state.settings)
+  print_plan_preview(state.plans, state.settings)
 
-  for index, item in ipairs(selected_items) do
-    analyses[#analyses + 1] = analyze_item(item, index, settings)
+  local ok, path_or_err = export_analysis_csv(state.analyses, state.plans, state.settings)
+  if not ok then
+    reaper.ShowMessageBox("CSV export failed:\n\n" .. tostring(path_or_err), SCRIPT_TITLE, 0)
+    set_status(state, "CSV export failed.")
+    return
   end
 
-  print_analysis_report(analyses, settings)
+  log_line("")
+  log_line("[Tail Processor] CSV exported to:")
+  log_line(path_or_err)
+  set_status(state, "CSV exported: " .. path_or_err)
+end
 
-  local plans = {}
-  for _, analysis in ipairs(analyses) do
-    plans[#plans + 1] = build_item_plan(analysis, settings)
+local function run_analysis_pass(state)
+  local items = collect_selected_items()
+  if #items == 0 then
+    set_status(state, "No selected media items.")
+    return false
   end
 
-  print_plan_preview(plans, settings)
+  state.selected_items = items
+  state.analyses = analyze_items(items, state.settings)
+  state.plans = build_plans_from_analyses(state.analyses, state.settings)
+  state.analysis_dirty = false
+  state.process_dirty = false
+  state.results_scroll = 0
+  set_status(state, string.format("Analyzed %d selected items.", #items))
+  return true
+end
 
-  local ok, result_or_err = process_plans(plans, selected_items, settings)
+local function run_action(state, action)
+  if not run_analysis_pass(state) then
+    return
+  end
+
+  reaper.ClearConsole()
+  print_analysis_report(state.analyses, state.settings)
+
+  if action == "analyze" then
+    return
+  end
+
+  local action_settings = clone_table(state.settings)
+  action_settings.dry_run = action == "dry_run"
+  local action_plans = build_plans_from_analyses(state.analyses, action_settings)
+
+  print_plan_preview(action_plans, action_settings)
+  local ok, result_or_err = process_plans(action_plans, state.selected_items, action_settings)
   if not ok then
     reaper.ShowMessageBox("Tail/Silence processing failed:\n\n" .. tostring(result_or_err), SCRIPT_TITLE, 0)
     log_line("")
     log_line("[Tail Processor] ERROR: " .. tostring(result_or_err))
+    set_status(state, "Processing failed. See console.")
     return
   end
 
-  print_final_summary(plans, settings, result_or_err)
+  print_final_summary(action_plans, action_settings, result_or_err)
+
+  if action == "process" then
+    run_analysis_pass(state)
+    set_status(state, string.format(
+      "Processed %d items. Regions: %d, Markers: %d.",
+      result_or_err.processed_count or 0,
+      result_or_err.updated_regions or 0,
+      result_or_err.created_markers or 0
+    ))
+  else
+    state.plans = action_plans
+    set_status(state, "Dry run complete. See console for details.")
+  end
+end
+
+local function draw_result_table(state, x, y, w, h)
+  draw_panel(x, y, w, h, "Analysis Results")
+  local header_y = y + 34
+  local row_y = header_y + 28
+  local plan_width = math.max(150, w - 36 - 240 - 80 - 76 - 76 - 70 - 28)
+  local columns = {
+    { label = "#", width = 36 },
+    { label = "Name", width = 240 },
+    { label = "Length", width = 80 },
+    { label = "Head", width = 76 },
+    { label = "Tail", width = 76 },
+    { label = "Peak", width = 70 },
+    { label = "Plan", width = plan_width },
+  }
+
+  local cursor_x = x + 10
+  gfx.setfont(1, "Arial", 14)
+  for _, column in ipairs(columns) do
+    draw_text(cursor_x, header_y, column.label, 166, 174, 186, 255)
+    cursor_x = cursor_x + column.width
+  end
+
+  local visible_rows = math.max(1, math.floor((h - 72) / GUI.table_row_h))
+  local max_scroll = math.max(0, #state.analyses - visible_rows)
+  local table_hover = point_in_rect(state.mouse_x, state.mouse_y, x + 6, row_y, w - 12, h - 54)
+
+  if table_hover and state.wheel_delta ~= 0 then
+    local step = state.wheel_delta > 0 and -1 or 1
+    state.results_scroll = clamp_number(state.results_scroll + step, 0, max_scroll)
+  end
+
+  for row_index = 1, visible_rows do
+    local data_index = state.results_scroll + row_index
+    local analysis = state.analyses[data_index]
+    local plan = state.plans[data_index]
+    local current_y = row_y + (row_index - 1) * GUI.table_row_h
+
+    set_color(row_index % 2 == 0 and 34 or 30, row_index % 2 == 0 and 38 or 34, 43, 255)
+    gfx.rect(x + 8, current_y, w - 16, GUI.table_row_h - 2, true)
+
+    if analysis then
+      local status_color = { 220, 224, 230, 255 }
+      if not analysis.valid then
+        status_color = { 234, 120, 120, 255 }
+      elseif analysis.is_silent then
+        status_color = { 220, 186, 104, 255 }
+      end
+
+      local cells = {
+        tostring(analysis.item_index),
+        truncate_text(analysis.take_name, 30),
+        format_seconds(analysis.total_length),
+        format_ms_from_sec(analysis.head_silence),
+        format_ms_from_sec(analysis.tail_silence),
+        format_db(analysis.peak_db),
+        truncate_text(summarize_plan(plan), 42),
+      }
+
+      local row_x = x + 10
+      for cell_index, column in ipairs(columns) do
+        local color = cell_index == 7 and status_color or { 220, 224, 230, 255 }
+        draw_text(row_x, current_y + 3, cells[cell_index], color[1], color[2], color[3], color[4])
+        row_x = row_x + column.width
+      end
+    end
+  end
+
+  if #state.analyses == 0 then
+    gfx.setfont(1, "Arial", 16)
+    draw_text(x + 16, y + 70, "No analysis yet. Select items and click Analyze Selected Items.", 170, 176, 184, 255)
+  end
+
+  if #state.analyses > visible_rows then
+    local thumb_h = math.max(28, (h - 88) * (visible_rows / #state.analyses))
+    local track_h = h - 88
+    local thumb_y = y + 62 + (track_h - thumb_h) * (state.results_scroll / math.max(1, max_scroll))
+    set_color(55, 60, 68, 255)
+    gfx.rect(x + w - 12, y + 62, 6, track_h, true)
+    set_color(120, 128, 140, 255)
+    gfx.rect(x + w - 12, thumb_y, 6, thumb_h, true)
+  end
+end
+
+local function draw_settings_column(state, x, y, w)
+  local cursor_y = y
+
+  draw_panel(x, cursor_y, w, 150, "Analysis Settings")
+  local row_y = cursor_y + 40
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Threshold", string.format("%.1f dB", state.settings.threshold_db), true) then
+    prompt_numeric_setting(state, "threshold_db", "Threshold (dB)", true, -150, 0, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Min Silence", string.format("%.1f ms", state.settings.min_silence_ms), true) then
+    prompt_numeric_setting(state, "min_silence_ms", "Min Silence (ms)", true, 0, 5000, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Block Size", tostring(state.settings.block_size), true) then
+    prompt_numeric_setting(state, "block_size", "Block Size (samples)", true, 64, 65536, 0, true)
+  end
+
+  cursor_y = cursor_y + 150 + GUI.section_gap
+  draw_panel(x, cursor_y, w, 118, "Head Trim")
+  row_y = cursor_y + 40
+  if draw_button(state, x + 12, row_y, 126, 24, "Head Trim", { active = state.settings.head_trim_enabled }) then
+    update_setting(state, "head_trim_enabled", not state.settings.head_trim_enabled, false)
+  end
+  if draw_button(state, x + 150, row_y, w - 162, 24, state.settings.keep_position and "Left Edge Fixed" or "Preserve Timing", { active = state.settings.keep_position }) then
+    update_setting(state, "keep_position", not state.settings.keep_position, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Pre-roll", string.format("%.1f ms", state.settings.pre_roll_ms), true) then
+    prompt_numeric_setting(state, "pre_roll_ms", "Head Pre-roll (ms)", false, 0, 500, 3, false)
+  end
+
+  cursor_y = cursor_y + 118 + GUI.section_gap
+  draw_panel(x, cursor_y, w, 196, "Tail Processing")
+  row_y = cursor_y + 40
+  if draw_button(state, x + 12, row_y, 126, 24, "Tail Enabled", { active = state.settings.tail_enabled }) then
+    update_setting(state, "tail_enabled", not state.settings.tail_enabled, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_button(state, x + 12, row_y, 78, 24, "Cut", { active = state.settings.tail_mode == "cut" }) then
+    update_setting(state, "tail_mode", "cut", false)
+  end
+  if draw_button(state, x + 96, row_y, 78, 24, "Fade", { active = state.settings.tail_mode == "fade" }) then
+    update_setting(state, "tail_mode", "fade", false)
+  end
+  if draw_button(state, x + 180, row_y, 110, 24, "Target", { active = state.settings.tail_mode == "target" }) then
+    update_setting(state, "tail_mode", "target", false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Post-roll", string.format("%.1f ms", state.settings.post_roll_ms), true) then
+    prompt_numeric_setting(state, "post_roll_ms", "Tail Post-roll (ms)", false, 0, 5000, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Fade Length", string.format("%.1f ms", state.settings.fade_length_ms), state.settings.tail_mode == "fade") then
+    prompt_numeric_setting(state, "fade_length_ms", "Fade Out Length (ms)", false, 0, 10000, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_button(state, x + 12, row_y, 70, 24, "Lin", { active = state.settings.fade_curve == "lin" }) then
+    update_setting(state, "fade_curve", "lin", false)
+  end
+  if draw_button(state, x + 88, row_y, 70, 24, "Exp", { active = state.settings.fade_curve == "exp" }) then
+    update_setting(state, "fade_curve", "exp", false)
+  end
+  if draw_button(state, x + 164, row_y, 92, 24, "S-Curve", { active = state.settings.fade_curve == "scurve" }) then
+    update_setting(state, "fade_curve", "scurve", false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Target Length", string.format("%.3f s", state.settings.target_length_sec), state.settings.tail_mode == "target") then
+    prompt_numeric_setting(state, "target_length_sec", "Target Length (sec)", false, 0, 3600, 6, false)
+  end
+
+  cursor_y = cursor_y + 196 + GUI.section_gap
+  draw_panel(x, cursor_y, w, 194, "Normalize")
+  row_y = cursor_y + 40
+  if draw_button(state, x + 12, row_y, 68, 24, "Off", { active = state.settings.normalize_mode == "off" }) then
+    update_setting(state, "normalize_mode", "off", false)
+  end
+  if draw_button(state, x + 86, row_y, 76, 24, "Peak", { active = state.settings.normalize_mode == "peak" }) then
+    update_setting(state, "normalize_mode", "peak", false)
+  end
+  if draw_button(state, x + 168, row_y, 70, 24, "RMS", { active = state.settings.normalize_mode == "rms" }) then
+    update_setting(state, "normalize_mode", "rms", false)
+  end
+  if draw_button(state, x + 244, row_y, 82, 24, "Category", { active = state.settings.normalize_mode == "category" }) then
+    update_setting(state, "normalize_mode", "category", false)
+  end
+  if draw_button(state, x + 12, row_y + GUI.row_h, w - 24, 24, state.settings.clip_protect and "Clip Protect On" or "Clip Protect Off", { active = state.settings.clip_protect }) then
+    update_setting(state, "clip_protect", not state.settings.clip_protect, false)
+  end
+  row_y = row_y + (GUI.row_h * 2)
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Target", string.format("%.1f dB", state.settings.normalize_target_db), state.settings.normalize_mode ~= "off") then
+    prompt_numeric_setting(state, "normalize_target_db", "Normalize Target (dB)", false, -150, 6, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Max Gain", string.format("%.1f dB", state.settings.max_gain_db), state.settings.normalize_mode ~= "off") then
+    prompt_numeric_setting(state, "max_gain_db", "Max Gain (dB)", false, 0, 60, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_button(
+    state,
+    x + 12,
+    row_y,
+    w - 24,
+    24,
+    string.format("Edit Category Rules (%d)", #(state.settings.category_rules or {})),
+    { active = state.settings.normalize_mode == "category" }
+  ) then
+    prompt_category_rules(state)
+  end
+
+  cursor_y = cursor_y + 194 + GUI.section_gap
+  draw_panel(x, cursor_y, w, 146, "Safety / Sync")
+  row_y = cursor_y + 40
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Min Item Length", string.format("%.1f ms", state.settings.min_length_ms), true) then
+    prompt_numeric_setting(state, "min_length_ms", "Min Item Length (ms)", false, 1, 10000, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_value_button(state, x + 12, row_y, w - 24, 22, "Max Trim Ratio", string.format("%.1f %%", state.settings.max_trim_ratio), true) then
+    prompt_numeric_setting(state, "max_trim_ratio", "Max Trim Ratio (%)", false, 0, 99.999, 3, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_button(state, x + 12, row_y, w - 24, 24, state.settings.sync_regions and "Sync Matching Regions" or "Do Not Sync Regions", { active = state.settings.sync_regions }) then
+    update_setting(state, "sync_regions", not state.settings.sync_regions, false)
+  end
+  row_y = row_y + GUI.row_h
+  if draw_button(state, x + 12, row_y, w - 24, 24, state.settings.create_markers and "Create Before/After Markers" or "No Comparison Markers", { active = state.settings.create_markers }) then
+    update_setting(state, "create_markers", not state.settings.create_markers, false)
+  end
+end
+
+local function draw_gui(state)
+  begin_gui_frame(state)
+
+  local window_w, window_h = gfx.w, gfx.h
+  set_color(20, 23, 27, 255)
+  gfx.rect(0, 0, window_w, window_h, true)
+
+  gfx.setfont(1, "Arial", 22)
+  draw_text(GUI.padding, GUI.padding, SCRIPT_TITLE, 238, 241, 245, 255)
+  gfx.setfont(1, "Arial", 14)
+  draw_text(GUI.padding, GUI.padding + 30, "Phase 2 GUI - analyze, preview, process, and keep settings persistent.", 176, 183, 192, 255)
+
+  local toolbar_y = GUI.padding + 56
+  if draw_button(state, GUI.padding, toolbar_y, 166, 30, "Analyze Selected Items", { enabled = true }) then
+    run_action(state, "analyze")
+  end
+  if draw_button(state, GUI.padding + 176, toolbar_y, 104, 30, "Dry Run", { enabled = true }) then
+    run_action(state, "dry_run")
+  end
+  if draw_button(state, GUI.padding + 290, toolbar_y, 118, 30, "Process All", { enabled = true }) then
+    run_action(state, "process")
+  end
+  if draw_button(state, GUI.padding + 418, toolbar_y, 102, 30, "Export CSV", { enabled = true }) then
+    run_export_action(state)
+  end
+  if draw_button(state, GUI.padding + 530, toolbar_y, 110, 30, "Quick Setup", { enabled = true }) then
+    adopt_prompt_settings(state)
+  end
+  if draw_button(state, window_w - GUI.padding - 96, toolbar_y, 96, 30, "Close", { enabled = true }) then
+    state.should_close = true
+  end
+
+  local stale_text = state.analysis_dirty and "Analysis stale" or (state.process_dirty and "Plan stale" or "Ready")
+  draw_text(GUI.padding + 654, toolbar_y + 7, stale_text, state.analysis_dirty and 230 or 150, state.analysis_dirty and 180 or 208, 120, 255)
+
+  local left_w = 336
+  local right_x = GUI.padding + left_w + GUI.section_gap
+  draw_settings_column(state, GUI.padding, toolbar_y + 44, left_w)
+  draw_result_table(state, right_x, toolbar_y + 44, window_w - right_x - GUI.padding, window_h - (toolbar_y + 92))
+
+  local footer_y = window_h - 30
+  set_color(38, 42, 48, 255)
+  gfx.rect(0, footer_y - 6, window_w, 36, true)
+  draw_text(GUI.padding, footer_y, state.status_message or "Ready.", 220, 224, 230, 255)
+  if #state.analyses > 0 then
+    draw_text(window_w - 260, footer_y, string.format("Rows: %d  Scroll: %d", #state.analyses, state.results_scroll), 156, 164, 174, 255)
+  end
+
+  finish_gui_frame()
+end
+
+local function run_gui()
+  gfx.init(SCRIPT_TITLE, GUI.width, GUI.height, 0)
+  local state = {
+    settings = load_settings(),
+    selected_items = {},
+    analyses = {},
+    plans = {},
+    status_message = "Select items, adjust settings, then analyze.",
+    analysis_dirty = true,
+    process_dirty = true,
+    results_scroll = 0,
+    prev_mouse_down = false,
+    prev_mouse_wheel = 0,
+    should_close = false,
+  }
+
+  local function loop()
+    if state.should_close or gfx.getchar() < 0 then
+      save_settings(state.settings)
+      return
+    end
+
+    draw_gui(state)
+    reaper.defer(loop)
+  end
+
+  loop()
+end
+
+local function main()
+  run_gui()
 end
 
 main()

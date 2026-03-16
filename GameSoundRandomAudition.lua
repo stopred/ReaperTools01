@@ -20,6 +20,12 @@ local LIVE_FOLDER_BASE_NAME = "Audition_Live"
 local SEQUENCE_FOLDER_BASE_NAME = "Audition_Sequence"
 local GUI_WINDOW_W = 680
 local GUI_WINDOW_H = 560
+local LPF_FX_NAME_CANDIDATES = {
+  "JS: filters/resonantlowpass",
+  "JS:filters/resonantlowpass",
+  "JS: Resonant Lowpass Filter",
+  "JS:Resonant Lowpass Filter",
+}
 
 local DEFAULTS = {
   group_mode = "track_folder",
@@ -28,6 +34,11 @@ local DEFAULTS = {
   pitch_range_cents = 100,
   volume_range_db = 3.0,
   no_repeat_mode = "no_immediate",
+  weight_mode = "auto_name",
+  lpf_min_freq = 0,
+  lpf_max_freq = 0,
+  delay_max_ms = 0,
+  export_csv = false,
   output_mode = "interactive",
 }
 
@@ -73,6 +84,21 @@ local function clamp_number(value, min_value, max_value)
   return value
 end
 
+local function bool_to_string(value)
+  return value and "y" or "n"
+end
+
+local function parse_boolean(value, default_value)
+  local lowered = trim_string(value):lower()
+  if lowered == "1" or lowered == "y" or lowered == "yes" or lowered == "true" or lowered == "on" then
+    return true
+  end
+  if lowered == "0" or lowered == "n" or lowered == "no" or lowered == "false" or lowered == "off" then
+    return false
+  end
+  return default_value
+end
+
 local function round_to(value, decimals)
   local power = 10 ^ (decimals or 0)
   if value >= 0 then
@@ -103,6 +129,27 @@ local function sanitize_base_name(name, fallback_index)
   return value
 end
 
+local function parse_item_weight(raw_name)
+  local value = trim_string(raw_name)
+  local weight = tonumber(value:match("%[w=([%d%.]+)%]"))
+    or tonumber(value:match("%[weight=([%d%.]+)%]"))
+    or tonumber(value:match("%{w=([%d%.]+)%}"))
+    or tonumber(value:match("%{weight=([%d%.]+)%}"))
+
+  local clean_name = value
+  clean_name = clean_name:gsub("%s*%[w=[%d%.]+%]", "")
+  clean_name = clean_name:gsub("%s*%[weight=[%d%.]+%]", "")
+  clean_name = clean_name:gsub("%s*%{w=[%d%.]+%}", "")
+  clean_name = clean_name:gsub("%s*%{weight=[%d%.]+%}", "")
+  clean_name = trim_string(clean_name)
+
+  if clean_name == "" then
+    clean_name = value
+  end
+
+  return clean_name, clamp_number(weight or 1.0, 0.0, 1000.0)
+end
+
 local function get_take_name_or_fallback(take, fallback_index)
   if not take then
     return sanitize_base_name("", fallback_index)
@@ -123,6 +170,13 @@ local function get_take_name_or_fallback(take, fallback_index)
   end
 
   return sanitize_base_name("", fallback_index)
+end
+
+local function format_weight_suffix(weight)
+  if not weight or math.abs(weight - 1.0) < 0.0001 then
+    return ""
+  end
+  return string.format(" x%.2f", weight)
 end
 
 local function get_track_name(track)
@@ -182,9 +236,42 @@ local function parse_output_mode(value)
   return nil
 end
 
+local function parse_weight_mode(value)
+  local lowered = trim_string(value):lower()
+  if lowered == "off" or lowered == "none" or lowered == "n" then
+    return "off"
+  end
+  if lowered == "auto_name" or lowered == "auto" or lowered == "name_tag" or lowered == "name" then
+    return "auto_name"
+  end
+  return nil
+end
+
 local function is_audition_folder_name(name)
   local value = trim_string(name)
   return value:match("^" .. LIVE_FOLDER_BASE_NAME) ~= nil or value:match("^" .. SEQUENCE_FOLDER_BASE_NAME) ~= nil
+end
+
+local function parse_range_pair(value, min_limit, max_limit)
+  local cleaned = trim_string(value)
+  local left, right = cleaned:match("^(%-?[%d%.]+)%s*[%-,:%s]%s*(%-?[%d%.]+)$")
+  if not left or not right then
+    return nil, nil
+  end
+
+  local min_value = tonumber(left)
+  local max_value = tonumber(right)
+  if not min_value or not max_value then
+    return nil, nil
+  end
+
+  min_value = clamp_number(min_value, min_limit, max_limit)
+  max_value = clamp_number(max_value, min_limit, max_limit)
+  if min_value > max_value then
+    min_value, max_value = max_value, min_value
+  end
+
+  return min_value, max_value
 end
 
 local function parse_no_repeat_mode(value)
@@ -221,6 +308,11 @@ local function load_settings()
     volume_range_db = tonumber(get_ext_state("volume_range_db", tostring(DEFAULTS.volume_range_db))) or DEFAULTS.volume_range_db,
     no_repeat_mode = no_repeat_mode or DEFAULTS.no_repeat_mode,
     no_repeat_count = no_repeat_count or 1,
+    weight_mode = parse_weight_mode(get_ext_state("weight_mode", DEFAULTS.weight_mode)) or DEFAULTS.weight_mode,
+    lpf_min_freq = tonumber(get_ext_state("lpf_min_freq", tostring(DEFAULTS.lpf_min_freq))) or DEFAULTS.lpf_min_freq,
+    lpf_max_freq = tonumber(get_ext_state("lpf_max_freq", tostring(DEFAULTS.lpf_max_freq))) or DEFAULTS.lpf_max_freq,
+    delay_max_ms = tonumber(get_ext_state("delay_max_ms", tostring(DEFAULTS.delay_max_ms))) or DEFAULTS.delay_max_ms,
+    export_csv = parse_boolean(get_ext_state("export_csv", bool_to_string(DEFAULTS.export_csv)), DEFAULTS.export_csv),
     output_mode = parse_output_mode(get_ext_state("output_mode", DEFAULTS.output_mode)) or DEFAULTS.output_mode,
   }
 end
@@ -237,6 +329,11 @@ local function save_settings(settings)
   reaper.SetExtState(EXT_SECTION, "pitch_range_cents", tostring(settings.pitch_range_cents), true)
   reaper.SetExtState(EXT_SECTION, "volume_range_db", tostring(settings.volume_range_db), true)
   reaper.SetExtState(EXT_SECTION, "no_repeat_mode", tostring(no_repeat_value), true)
+  reaper.SetExtState(EXT_SECTION, "weight_mode", tostring(settings.weight_mode), true)
+  reaper.SetExtState(EXT_SECTION, "lpf_min_freq", tostring(settings.lpf_min_freq), true)
+  reaper.SetExtState(EXT_SECTION, "lpf_max_freq", tostring(settings.lpf_max_freq), true)
+  reaper.SetExtState(EXT_SECTION, "delay_max_ms", tostring(settings.delay_max_ms), true)
+  reaper.SetExtState(EXT_SECTION, "export_csv", bool_to_string(settings.export_csv), true)
   reaper.SetExtState(EXT_SECTION, "output_mode", tostring(settings.output_mode), true)
 end
 
@@ -262,13 +359,17 @@ local function prompt_for_settings(current)
     tostring(current.pitch_range_cents or DEFAULTS.pitch_range_cents),
     tostring(current.volume_range_db or DEFAULTS.volume_range_db),
     current.no_repeat_mode == "no_last_n" and ("no_last_" .. tostring(current.no_repeat_count or 2)) or current.no_repeat_mode,
+    current.weight_mode or DEFAULTS.weight_mode,
+    string.format("%.0f-%.0f", current.lpf_min_freq or DEFAULTS.lpf_min_freq, current.lpf_max_freq or DEFAULTS.lpf_max_freq),
+    tostring(current.delay_max_ms or DEFAULTS.delay_max_ms),
+    bool_to_string(current.export_csv),
     current.output_mode or DEFAULTS.output_mode,
   }
 
   while true do
     local ok, values = reaper.GetUserInputs(
       SCRIPT_TITLE,
-      7,
+      11,
       table.concat({
         "extrawidth=300",
         "separator=|",
@@ -278,6 +379,10 @@ local function prompt_for_settings(current)
         "Pitch Range (+/- cents)",
         "Volume Range (+/- dB)",
         "No-Repeat (none/no_immediate/shuffle/no_last_2...)",
+        "Weight Mode (off/auto_name)",
+        "LPF Range (min-max Hz, 0-0 off)",
+        "Delay Max (ms, 0 off)",
+        "Auto Export CSV (y/n)",
         "Output Mode (interactive/play/render_sequence)",
       }, ","),
       table.concat(defaults, "|")
@@ -287,7 +392,7 @@ local function prompt_for_settings(current)
       return nil, "User cancelled."
     end
 
-    local parts = split_delimited(values, "|", 7)
+    local parts = split_delimited(values, "|", 11)
     defaults = parts
 
     local group_mode = parse_group_mode(parts[1])
@@ -296,7 +401,11 @@ local function prompt_for_settings(current)
     local pitch_range_cents = tonumber(parts[4])
     local volume_range_db = tonumber(parts[5])
     local no_repeat_mode, no_repeat_count = parse_no_repeat_mode(parts[6])
-    local output_mode = parse_output_mode(parts[7])
+    local weight_mode = parse_weight_mode(parts[7])
+    local lpf_min_freq, lpf_max_freq = parse_range_pair(parts[8], 0, 24000)
+    local delay_max_ms = tonumber(parts[9])
+    local export_csv = parse_boolean(parts[10], nil)
+    local output_mode = parse_output_mode(parts[11])
 
     if not group_mode then
       reaper.ShowMessageBox("Group Detection must be track_folder, item_name, or selection.", SCRIPT_TITLE, 0)
@@ -310,6 +419,14 @@ local function prompt_for_settings(current)
       reaper.ShowMessageBox("Volume Range must be between 0 and 24 dB.", SCRIPT_TITLE, 0)
     elseif not no_repeat_mode then
       reaper.ShowMessageBox("No-Repeat must be none, no_immediate, shuffle, or no_last_2 style.", SCRIPT_TITLE, 0)
+    elseif not weight_mode then
+      reaper.ShowMessageBox("Weight Mode must be off or auto_name.", SCRIPT_TITLE, 0)
+    elseif lpf_min_freq == nil or lpf_max_freq == nil then
+      reaper.ShowMessageBox("LPF Range must be written as min-max, for example 2000-12000 or 0-0.", SCRIPT_TITLE, 0)
+    elseif not delay_max_ms or delay_max_ms < 0 or delay_max_ms > 5000 then
+      reaper.ShowMessageBox("Delay Max must be between 0 and 5000 ms.", SCRIPT_TITLE, 0)
+    elseif export_csv == nil then
+      reaper.ShowMessageBox("Auto Export CSV must be y or n.", SCRIPT_TITLE, 0)
     elseif not output_mode then
       reaper.ShowMessageBox("Output Mode must be interactive, play, or render_sequence.", SCRIPT_TITLE, 0)
     else
@@ -321,6 +438,11 @@ local function prompt_for_settings(current)
         volume_range_db = volume_range_db,
         no_repeat_mode = no_repeat_mode,
         no_repeat_count = no_repeat_count,
+        weight_mode = weight_mode,
+        lpf_min_freq = lpf_min_freq,
+        lpf_max_freq = lpf_max_freq,
+        delay_max_ms = delay_max_ms,
+        export_csv = export_csv,
         output_mode = output_mode,
       }
     end
@@ -407,15 +529,18 @@ local function collect_items_from_folder_entry(snapshot, folder_entry)
         local item_position = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
         local item_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
         local raw_name = get_take_name_or_fallback(take, fallback_index)
+        local clean_name, weight = parse_item_weight(raw_name)
 
         items[#items + 1] = {
           item = item,
           take = take,
           track = entry.track,
           track_name = entry.name,
-          name = raw_name,
-          display_name = raw_name,
-          key = string.format("%s|%d|%.6f|%.6f", raw_name, entry.index, item_position, item_length),
+          name = clean_name,
+          raw_name = raw_name,
+          display_name = clean_name,
+          weight = weight,
+          key = string.format("%s|%d|%.6f|%.6f|%.4f", clean_name, entry.index, item_position, item_length, weight),
           position = item_position,
           length = item_length,
           track_index = entry.index,
@@ -604,7 +729,8 @@ local function detect_item_name_groups()
     local take = reaper.GetActiveTake(item)
     if take then
       local take_name = get_take_name_or_fallback(take, index)
-      local group_name = take_name:match("^(.+)_Var%d+$") or take_name:match("^(.+)_%d+$")
+      local clean_name, weight = parse_item_weight(take_name)
+      local group_name = clean_name:match("^(.+)_Var%d+$") or clean_name:match("^(.+)_%d+$")
 
       if group_name then
         local track = reaper.GetMediaItemTrack(item)
@@ -630,9 +756,11 @@ local function detect_item_name_groups()
           take = take,
           track = track,
           track_name = get_track_name(track),
-          name = take_name,
-          display_name = take_name,
-          key = string.format("%s|%d|%.6f|%.6f", take_name, track_index, item_position, item_length),
+          name = clean_name,
+          raw_name = take_name,
+          display_name = clean_name,
+          weight = weight,
+          key = string.format("%s|%d|%.6f|%.6f|%.4f", clean_name, track_index, item_position, item_length, weight),
           position = item_position,
           length = item_length,
           track_index = track_index,
@@ -679,15 +807,18 @@ local function detect_selection_group()
       local item_position = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
       local item_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
       local item_name = get_take_name_or_fallback(take, item_index + 1)
+      local clean_name, weight = parse_item_weight(item_name)
 
       items[#items + 1] = {
         item = item,
         take = take,
         track = track,
         track_name = get_track_name(track),
-        name = item_name,
-        display_name = item_name,
-        key = string.format("%s|%d|%.6f|%.6f", item_name, track_index, item_position, item_length),
+        name = clean_name,
+        raw_name = item_name,
+        display_name = clean_name,
+        weight = weight,
+        key = string.format("%s|%d|%.6f|%.6f|%.4f", clean_name, track_index, item_position, item_length, weight),
         position = item_position,
         length = item_length,
         track_index = track_index,
@@ -792,6 +923,33 @@ local function filter_out_recent_items(items, history, count)
   return available
 end
 
+local function weighted_random_pick(items)
+  local total_weight = 0.0
+  local weighted_items = {}
+
+  for _, item in ipairs(items) do
+    local weight = math.max(0.0, tonumber(item.weight) or 1.0)
+    total_weight = total_weight + weight
+    weighted_items[#weighted_items + 1] = {
+      item = item,
+      cumulative = total_weight,
+    }
+  end
+
+  if total_weight <= 0.0 then
+    return items[math.random(1, #items)]
+  end
+
+  local roll = math.random() * total_weight
+  for _, weighted_item in ipairs(weighted_items) do
+    if roll <= weighted_item.cumulative then
+      return weighted_item.item
+    end
+  end
+
+  return items[#items]
+end
+
 local function pick_from_group(group, settings)
   if #group.items == 1 then
     local only_item = group.items[1]
@@ -808,13 +966,13 @@ local function pick_from_group(group, settings)
     picked = table.remove(group.shuffle_bag, 1)
   elseif settings.no_repeat_mode == "no_immediate" then
     local available = filter_out_recent_items(group.items, group.history, 1)
-    picked = available[math.random(1, #available)]
+    picked = settings.weight_mode == "auto_name" and weighted_random_pick(available) or available[math.random(1, #available)]
   elseif settings.no_repeat_mode == "no_last_n" then
     local avoid_count = clamp_number(settings.no_repeat_count or 2, 1, math.max(1, #group.items - 1))
     local available = filter_out_recent_items(group.items, group.history, avoid_count)
-    picked = available[math.random(1, #available)]
+    picked = settings.weight_mode == "auto_name" and weighted_random_pick(available) or available[math.random(1, #available)]
   else
-    picked = group.items[math.random(1, #group.items)]
+    picked = settings.weight_mode == "auto_name" and weighted_random_pick(group.items) or group.items[math.random(1, #group.items)]
   end
 
   group.history[#group.history + 1] = picked.key
@@ -834,6 +992,7 @@ local function pick_random_combination(groups, settings)
       track = picked.track,
       name = picked.display_name,
       source_name = picked.name,
+      weight = picked.weight,
       key = picked.key,
       position = picked.position,
       length = picked.length,
@@ -864,12 +1023,31 @@ local function sample_volume_db(settings)
   return random_uniform(-range_value, range_value)
 end
 
+local function sample_lpf_freq(settings)
+  local min_freq = tonumber(settings.lpf_min_freq or 0) or 0
+  local max_freq = tonumber(settings.lpf_max_freq or 0) or 0
+  if min_freq <= 0 or max_freq <= 0 or max_freq < min_freq then
+    return nil
+  end
+  return random_uniform(min_freq, max_freq)
+end
+
+local function sample_delay_ms(settings)
+  local max_delay = tonumber(settings.delay_max_ms or 0) or 0
+  if max_delay <= 0 then
+    return nil
+  end
+  return random_uniform(0, max_delay)
+end
+
 local function apply_random_modifiers(combination, settings)
   local applied = {}
 
   for _, pick in ipairs(combination) do
     local pitch_cents = sample_pitch_cents(settings)
     local volume_db = sample_volume_db(settings)
+    local lpf_freq = sample_lpf_freq(settings)
+    local delay_ms = sample_delay_ms(settings)
 
     applied[#applied + 1] = {
       pick = pick,
@@ -877,6 +1055,8 @@ local function apply_random_modifiers(combination, settings)
         pitch_cents = pitch_cents,
         pitch_semitones = pitch_cents and (pitch_cents / 100.0) or nil,
         volume_db = volume_db,
+        lpf_freq = lpf_freq,
+        delay_ms = delay_ms,
       },
     }
   end
@@ -900,7 +1080,7 @@ local function log_detected_groups(groups)
   for _, group in ipairs(groups) do
     local names = {}
     for item_index, item in ipairs(group.items) do
-      names[#names + 1] = item.display_name
+      names[#names + 1] = item.display_name .. format_weight_suffix(item.weight)
       if item_index >= 8 and #group.items > 8 then
         names[#names + 1] = "..."
         break
@@ -923,11 +1103,20 @@ local function log_play_entry(play_index, applied)
   local log_parts = { string.format("Play #%02d:", play_index) }
   for _, entry in ipairs(applied) do
     local part = string.format("[%s: %s", entry.pick.group_name, entry.pick.name)
+    if entry.pick.weight and math.abs(entry.pick.weight - 1.0) >= 0.0001 then
+      part = part .. string.format(" W%.2f", entry.pick.weight)
+    end
     if entry.mods.pitch_cents ~= nil then
       part = part .. " " .. format_modifier_value(entry.mods.pitch_cents, 0, "P", "c")
     end
     if entry.mods.volume_db ~= nil then
       part = part .. " " .. format_modifier_value(entry.mods.volume_db, 1, "V", "dB")
+    end
+    if entry.mods.lpf_freq ~= nil then
+      part = part .. string.format(" LPF%.0fHz", round_to(entry.mods.lpf_freq, 0))
+    end
+    if entry.mods.delay_ms ~= nil then
+      part = part .. string.format(" D%.1fms", round_to(entry.mods.delay_ms, 1))
     end
     part = part .. "]"
     log_parts[#log_parts + 1] = part
@@ -983,6 +1172,38 @@ local function regenerate_chunk_guids(chunk)
   end
 
   return table.concat(lines, "\n")
+end
+
+local WARNED_MESSAGES = {}
+
+local function log_warning_once(key, message)
+  if WARNED_MESSAGES[key] then
+    return
+  end
+  WARNED_MESSAGES[key] = true
+  log_line("[Warning] " .. tostring(message))
+end
+
+local function apply_lpf_to_take(take, lpf_freq)
+  if not take or not lpf_freq then
+    return true
+  end
+
+  local fx_index = -1
+  for _, fx_name in ipairs(LPF_FX_NAME_CANDIDATES) do
+    fx_index = reaper.TakeFX_AddByName(take, fx_name, 1)
+    if fx_index >= 0 then
+      break
+    end
+  end
+
+  if fx_index < 0 then
+    return false, "Could not load stock JS lowpass filter (filters/resonantlowpass)."
+  end
+
+  reaper.TakeFX_SetParam(take, fx_index, 0, lpf_freq)
+  reaper.TakeFX_SetParam(take, fx_index, 1, 0.10)
+  return true
 end
 
 local function duplicate_item_to_track(source_item, dest_track)
@@ -1102,7 +1323,7 @@ local function render_audition_sequence(history, groups, settings)
       end
 
       local relative_offset = entry.pick.position - origin_position
-      local new_position = play_start + relative_offset
+      local new_position = play_start + relative_offset + ((entry.mods.delay_ms or 0) / 1000.0)
       reaper.SetMediaItemInfo_Value(new_item, "D_POSITION", new_position)
 
       local take = reaper.GetActiveTake(new_item)
@@ -1115,6 +1336,13 @@ local function render_audition_sequence(history, groups, settings)
         if entry.mods.volume_db ~= nil then
           local original_volume = reaper.GetMediaItemTakeInfo_Value(take, "D_VOL")
           reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", original_volume * db_to_linear(entry.mods.volume_db))
+        end
+
+        if entry.mods.lpf_freq ~= nil then
+          local ok_lpf, lpf_err = apply_lpf_to_take(take, entry.mods.lpf_freq)
+          if not ok_lpf then
+            log_warning_once("lpf_missing", lpf_err)
+          end
         end
 
         set_take_name(take, string.format("Aud%02d_%s", play_number, entry.pick.name))
@@ -1176,7 +1404,7 @@ local function render_live_play(state, play)
     end
 
     local relative_offset = entry.pick.position - state.origin_position
-    local new_position = start_position + relative_offset
+    local new_position = start_position + relative_offset + ((entry.mods.delay_ms or 0) / 1000.0)
     reaper.SetMediaItemInfo_Value(new_item, "D_POSITION", new_position)
 
     local take = reaper.GetActiveTake(new_item)
@@ -1189,6 +1417,13 @@ local function render_live_play(state, play)
       if entry.mods.volume_db ~= nil then
         local original_volume = reaper.GetMediaItemTakeInfo_Value(take, "D_VOL")
         reaper.SetMediaItemTakeInfo_Value(take, "D_VOL", original_volume * db_to_linear(entry.mods.volume_db))
+      end
+
+      if entry.mods.lpf_freq ~= nil then
+        local ok_lpf, lpf_err = apply_lpf_to_take(take, entry.mods.lpf_freq)
+        if not ok_lpf then
+          log_warning_once("lpf_missing", lpf_err)
+        end
       end
 
       set_take_name(take, string.format("Live%02d_%s", play.index, entry.pick.name))
@@ -1376,7 +1611,8 @@ local function draw_interactive_gui(state)
   if no_repeat_label == "no_last_n" then
     no_repeat_label = no_repeat_label .. " (" .. tostring(state.settings.no_repeat_count or 2) .. ")"
   end
-  draw_text(326, 184, string.format("No-Repeat: %s", no_repeat_label), 0.92, 0.92, 0.83, 1, 2)
+  draw_text(326, 184, string.format("No-Repeat / Weight: %s / %s", no_repeat_label, state.settings.weight_mode), 0.92, 0.92, 0.83, 1, 2)
+  draw_text(326, 206, string.format("LPF / Delay: %.0f-%.0f Hz / %.1f ms", state.settings.lpf_min_freq, state.settings.lpf_max_freq, state.settings.delay_max_ms), 0.92, 0.92, 0.83, 1, 2)
 
   gfx.set(0.12, 0.13, 0.16, 1)
   gfx.rect(18, 228, 280, 250, true)
@@ -1387,7 +1623,7 @@ local function draw_interactive_gui(state)
   for _, group in ipairs(state.groups) do
     local item_names = {}
     for item_index, item in ipairs(group.items) do
-      item_names[#item_names + 1] = item.display_name
+      item_names[#item_names + 1] = item.display_name .. format_weight_suffix(item.weight)
       if item_index >= 4 and #group.items > 4 then
         item_names[#item_names + 1] = "..."
         break
@@ -1412,11 +1648,20 @@ local function draw_interactive_gui(state)
   if state.last_play then
     for _, entry in ipairs(state.last_play.applied_mods) do
       local line = string.format("%s: %s", entry.pick.group_name, entry.pick.name)
+      if entry.pick.weight and math.abs(entry.pick.weight - 1.0) >= 0.0001 then
+        line = line .. string.format("  W%.2f", entry.pick.weight)
+      end
       if entry.mods.pitch_cents ~= nil then
         line = line .. "  " .. format_modifier_value(entry.mods.pitch_cents, 0, "P", "c")
       end
       if entry.mods.volume_db ~= nil then
         line = line .. "  " .. format_modifier_value(entry.mods.volume_db, 1, "V", "dB")
+      end
+      if entry.mods.lpf_freq ~= nil then
+        line = line .. string.format("  LPF%.0fHz", round_to(entry.mods.lpf_freq, 0))
+      end
+      if entry.mods.delay_ms ~= nil then
+        line = line .. string.format("  D%.1fms", round_to(entry.mods.delay_ms, 1))
       end
 
       draw_text(326, combo_y, line, 0.78, 0.92, 0.86, 1, 2)
@@ -1430,7 +1675,11 @@ local function draw_interactive_gui(state)
     draw_text(326, 436, string.format("Last output: %s", state.last_render_info.folder_name or ""), 0.92, 0.92, 0.83, 1, 2)
   end
 
-  draw_text(18, gfx.h - 84, "SPACE trigger | R rapid fire+play | S render only | D re-detect | T stats | ESC exit", 0.74, 0.78, 0.84, 1, 2)
+  if state.last_export_path then
+    draw_text(326, 458, "Last CSV: " .. state.last_export_path, 0.72, 0.84, 0.78, 1, 2)
+  end
+
+  draw_text(18, gfx.h - 84, "SPACE trigger | R rapid fire+play | S render only | D re-detect | T stats | E export | ESC exit", 0.74, 0.78, 0.84, 1, 2)
 
   local buttons = build_interactive_buttons(gfx.h)
   for _, button in ipairs(buttons) do
@@ -1453,6 +1702,21 @@ local function print_interactive_statistics(state)
   state.status_message = string.format("Printed statistics for %d plays", #state.history)
 end
 
+local function export_interactive_statistics(state)
+  local export_path, export_err = export_statistics_to_csv(state.history, state.groups, state.settings, state.last_render_info)
+  if export_path then
+    state.last_export_path = export_path
+    state.status_message = "CSV exported: " .. export_path
+    log_line("CSV exported: " .. export_path)
+    reaper.SetExtState(EXT_SECTION, "last_export_path", export_path, true)
+    return true
+  end
+
+  state.status_message = "CSV export failed: " .. tostring(export_err)
+  log_line("[Warning] CSV export failed: " .. tostring(export_err))
+  return false
+end
+
 local function refresh_interactive_groups(state)
   local groups, detect_err = detect_layer_groups(state.settings.group_mode)
   if not groups then
@@ -1467,6 +1731,7 @@ local function refresh_interactive_groups(state)
   state.play_count = 0
   state.last_play = nil
   state.last_render_info = nil
+  state.last_export_path = nil
   state.status_message = string.format("Detected %d groups. Session history reset.", #groups)
   log_detected_groups(groups)
   return true
@@ -1484,6 +1749,9 @@ local function stop_interactive_audition(state)
   if #state.history > 0 then
     print_statistics(state.history, state.groups, state.settings, state.last_render_info)
     save_session_summary(state.history, state.groups, state.last_render_info)
+    if state.settings.export_csv then
+      export_interactive_statistics(state)
+    end
   else
     log_line("Interactive session ended with no plays.")
   end
@@ -1500,6 +1768,8 @@ local function handle_interactive_action(state, action_id)
     perform_interactive_sequence(state, false)
   elseif action_id == "stats" then
     print_interactive_statistics(state)
+  elseif action_id == "export" then
+    export_interactive_statistics(state)
   elseif action_id == "redetect" then
     refresh_interactive_groups(state)
   elseif action_id == "exit" then
@@ -1531,6 +1801,8 @@ local function interactive_defer_loop()
     handle_interactive_action(state, "render")
   elseif char == string.byte("t") or char == string.byte("T") then
     handle_interactive_action(state, "stats")
+  elseif char == string.byte("e") or char == string.byte("E") then
+    handle_interactive_action(state, "export")
   elseif char == string.byte("d") or char == string.byte("D") then
     handle_interactive_action(state, "redetect")
   end
@@ -1568,6 +1840,7 @@ local function start_interactive_audition(groups, settings)
     play_count = 0,
     last_play = nil,
     last_render_info = nil,
+    last_export_path = nil,
     live_output = nil,
     status_message = "Interactive mode ready.",
     mouse_was_down = false,
@@ -1589,6 +1862,7 @@ local function start_interactive_audition(groups, settings)
   log_line("S: render sequence only")
   log_line("D: re-detect groups")
   log_line("T: print session statistics")
+  log_line("E: export statistics CSV")
   log_line("ESC: exit interactive mode")
   log_line("")
 
@@ -1717,6 +1991,10 @@ local function collect_modifier_ranges(history)
     pitch_max = nil,
     volume_min = nil,
     volume_max = nil,
+    lpf_min = nil,
+    lpf_max = nil,
+    delay_min = nil,
+    delay_max = nil,
   }
 
   for _, play in ipairs(history) do
@@ -1729,6 +2007,16 @@ local function collect_modifier_ranges(history)
       if entry.mods.volume_db ~= nil then
         result.volume_min = result.volume_min and math.min(result.volume_min, entry.mods.volume_db) or entry.mods.volume_db
         result.volume_max = result.volume_max and math.max(result.volume_max, entry.mods.volume_db) or entry.mods.volume_db
+      end
+
+      if entry.mods.lpf_freq ~= nil then
+        result.lpf_min = result.lpf_min and math.min(result.lpf_min, entry.mods.lpf_freq) or entry.mods.lpf_freq
+        result.lpf_max = result.lpf_max and math.max(result.lpf_max, entry.mods.lpf_freq) or entry.mods.lpf_freq
+      end
+
+      if entry.mods.delay_ms ~= nil then
+        result.delay_min = result.delay_min and math.min(result.delay_min, entry.mods.delay_ms) or entry.mods.delay_ms
+        result.delay_max = result.delay_max and math.max(result.delay_max, entry.mods.delay_ms) or entry.mods.delay_ms
       end
     end
   end
@@ -1814,7 +2102,162 @@ local function print_statistics(history, groups, settings, render_info)
     log_line("Volume: Off")
   end
 
+  if modifiers.lpf_min ~= nil then
+    log_line(string.format(
+      "LPF:    %.0f to %.0f Hz (target: %.0f-%.0f)",
+      modifiers.lpf_min,
+      modifiers.lpf_max,
+      settings.lpf_min_freq,
+      settings.lpf_max_freq
+    ))
+  else
+    log_line("LPF:    Off")
+  end
+
+  if modifiers.delay_min ~= nil then
+    log_line(string.format(
+      "Delay:  %.1f to %.1f ms (target: 0-%.1f)",
+      modifiers.delay_min,
+      modifiers.delay_max,
+      settings.delay_max_ms
+    ))
+  else
+    log_line("Delay:  Off")
+  end
+
   log_line("================================================================")
+end
+
+local function csv_escape(value)
+  local text = tostring(value == nil and "" or value)
+  if text:find("[,\"]") or text:find("\n") or text:find("\r") then
+    text = "\"" .. text:gsub("\"", "\"\"") .. "\""
+  end
+  return text
+end
+
+local function build_csv_export_path()
+  local base_dir = trim_string(reaper.GetProjectPathEx(0))
+  if base_dir == "" then
+    base_dir = trim_string(reaper.GetResourcePath())
+  end
+  base_dir = base_dir:gsub("\\", "/")
+  return string.format("%s/GameSoundRandomAudition_Stats_%s.csv", base_dir, os.date("%Y%m%d_%H%M%S"))
+end
+
+local function export_statistics_to_csv(history, groups, settings, render_info)
+  if #history == 0 then
+    return nil, "No audition history exists yet."
+  end
+
+  local report = analyze_distribution(history, groups)
+  local repeats = analyze_repeats(history, groups)
+  local modifiers = collect_modifier_ranges(history)
+  local export_path = build_csv_export_path()
+  local file, err = io.open(export_path, "w")
+  if not file then
+    return nil, err or "Failed to create CSV file."
+  end
+
+  local headers = {
+    "row_type",
+    "group_name",
+    "item_name",
+    "item_weight",
+    "count",
+    "percent",
+    "deviation_pct",
+    "group_total_picks",
+    "group_max_deviation_pct",
+    "group_is_even",
+    "total_plays",
+    "render_track",
+    "pitch_min_cents",
+    "pitch_max_cents",
+    "volume_min_db",
+    "volume_max_db",
+    "lpf_min_hz",
+    "lpf_max_hz",
+    "delay_min_ms",
+    "delay_max_ms",
+    "repeat_instances",
+    "longest_repeat_run",
+    "longest_repeat_group",
+    "longest_repeat_item",
+    "exported_at",
+  }
+
+  file:write(table.concat(headers, ",") .. "\n")
+
+  local exported_at = os.date("%Y-%m-%d %H:%M:%S")
+  local group_lookup = {}
+  for _, group in ipairs(groups) do
+    group_lookup[group.display_name] = group
+  end
+
+  for _, group_report in ipairs(report) do
+    local group = group_lookup[group_report.group_name]
+    local weight_lookup = {}
+    if group then
+      for _, item in ipairs(group.items) do
+        weight_lookup[item.display_name] = item.weight or 1.0
+      end
+    end
+
+    for _, item_stat in ipairs(group_report.item_stats) do
+      local row = {
+        "summary",
+        group_report.group_name,
+        item_stat.name,
+        string.format("%.4f", weight_lookup[item_stat.name] or 1.0),
+        tostring(item_stat.count),
+        string.format("%.4f", item_stat.percent),
+        string.format("%.4f", item_stat.deviation),
+        tostring(group_report.total_picks),
+        string.format("%.4f", group_report.max_deviation_pct),
+        group_report.is_even and "true" or "false",
+        tostring(#history),
+        render_info and render_info.folder_name or "",
+        modifiers.pitch_min and string.format("%.4f", modifiers.pitch_min) or "",
+        modifiers.pitch_max and string.format("%.4f", modifiers.pitch_max) or "",
+        modifiers.volume_min and string.format("%.4f", modifiers.volume_min) or "",
+        modifiers.volume_max and string.format("%.4f", modifiers.volume_max) or "",
+        modifiers.lpf_min and string.format("%.4f", modifiers.lpf_min) or "",
+        modifiers.lpf_max and string.format("%.4f", modifiers.lpf_max) or "",
+        modifiers.delay_min and string.format("%.4f", modifiers.delay_min) or "",
+        modifiers.delay_max and string.format("%.4f", modifiers.delay_max) or "",
+        tostring(repeats.total_consecutive_same),
+        tostring(repeats.longest_run),
+        repeats.longest_group or "",
+        repeats.longest_name or "",
+        exported_at,
+      }
+
+      for index = 1, #row do
+        row[index] = csv_escape(row[index])
+      end
+      file:write(table.concat(row, ",") .. "\n")
+    end
+  end
+
+  file:close()
+  return export_path
+end
+
+local function maybe_auto_export_csv(history, groups, settings, render_info)
+  if not settings.export_csv then
+    return nil
+  end
+
+  local export_path, export_err = export_statistics_to_csv(history, groups, settings, render_info)
+  if export_path then
+    log_line("CSV exported: " .. export_path)
+    reaper.SetExtState(EXT_SECTION, "last_export_path", export_path, true)
+    return export_path
+  end
+
+  log_line("[Warning] CSV export failed: " .. tostring(export_err))
+  return nil
 end
 
 local function start_sequence_playback(render_info)
@@ -1883,6 +2326,7 @@ local function main()
 
   print_statistics(history, groups, settings, render_info)
   save_session_summary(history, groups, render_info)
+  maybe_auto_export_csv(history, groups, settings, render_info)
 end
 
 main()

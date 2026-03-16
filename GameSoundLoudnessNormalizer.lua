@@ -159,6 +159,12 @@ local function strip_extension(name)
   return trim_string(name):gsub("%.[^%.\\/]+$", "")
 end
 
+local function sanitize_category_key(name)
+  local sanitized = trim_string(name):gsub("[|;\r\n\t]", "_")
+  sanitized = sanitized:gsub("%s%s+", " ")
+  return sanitized
+end
+
 local function truncate_text(value, max_length)
   local text = tostring(value or "")
   if #text <= max_length then
@@ -267,6 +273,74 @@ local function deserialize_presets(serialized)
   return presets
 end
 
+local function sanitize_preset_name(name)
+  local sanitized = trim_string(name):gsub("[\r\n\t|]", " ")
+  sanitized = sanitized:gsub("%s%s+", " ")
+  if sanitized == "" then
+    return "Default"
+  end
+  return sanitized
+end
+
+local function serialize_preset_sets(preset_sets)
+  local names = {}
+  for name in pairs(preset_sets or {}) do
+    names[#names + 1] = sanitize_preset_name(name)
+  end
+  sort_strings_case_insensitive(names)
+
+  local lines = {}
+  local seen = {}
+  for _, name in ipairs(names) do
+    if not seen[name] then
+      seen[name] = true
+      lines[#lines + 1] = name .. "\t" .. serialize_presets(preset_sets[name] or {})
+    end
+  end
+  return table.concat(lines, "\n")
+end
+
+local function deserialize_preset_sets(serialized)
+  local preset_sets = {}
+  local text = tostring(serialized or "")
+  for line in text:gmatch("[^\r\n]+") do
+    local name, preset_blob = line:match("^([^\t]+)\t(.*)$")
+    if name and preset_blob then
+      preset_sets[sanitize_preset_name(name)] = deserialize_presets(preset_blob)
+    end
+  end
+  return preset_sets
+end
+
+local function ensure_default_preset_sets(preset_sets)
+  local ensured = preset_sets or {}
+  if not ensured["Default"] then
+    ensured["Default"] = copy_presets(DEFAULT_CATEGORY_TARGETS)
+  end
+  return ensured
+end
+
+local function rebuild_preset_lookup(settings)
+  settings.preset_lookup = {}
+  for key in pairs(settings.presets or {}) do
+    settings.preset_lookup[key:lower()] = key
+  end
+end
+
+local function load_preset_set_into_settings(settings, preset_name)
+  settings.preset_sets = ensure_default_preset_sets(settings.preset_sets)
+  local normalized_name = sanitize_preset_name(preset_name)
+  local preset_data = settings.preset_sets[normalized_name]
+  if not preset_data then
+    return false
+  end
+
+  settings.preset_name = normalized_name
+  settings.presets = merge_presets(DEFAULT_CATEGORY_TARGETS, preset_data)
+  rebuild_preset_lookup(settings)
+  return true
+end
+
 local function get_ext_state(key, default_value)
   local value = reaper.GetExtState(EXT_SECTION, key)
   if value == nil or value == "" then
@@ -343,22 +417,30 @@ local function load_settings()
   settings.block_size = math.floor((tonumber(get_ext_state("block_size", tostring(DEFAULTS.block_size))) or DEFAULTS.block_size) + 0.5)
   settings.lufs_window_sec = tonumber(get_ext_state("lufs_window_sec", tostring(DEFAULTS.lufs_window_sec))) or DEFAULTS.lufs_window_sec
   settings.lufs_hop_sec = tonumber(get_ext_state("lufs_hop_sec", tostring(DEFAULTS.lufs_hop_sec))) or DEFAULTS.lufs_hop_sec
-  settings.preset_name = trim_string(get_ext_state("preset_name", DEFAULTS.preset_name))
-  if settings.preset_name == "" then
-    settings.preset_name = DEFAULTS.preset_name
-  end
+  settings.preset_name = sanitize_preset_name(get_ext_state("preset_name", DEFAULTS.preset_name))
 
   local stored_presets = deserialize_presets(get_ext_state("category_presets", ""))
-  settings.presets = merge_presets(DEFAULT_CATEGORY_TARGETS, stored_presets)
-  settings.preset_lookup = {}
-  for key in pairs(settings.presets) do
-    settings.preset_lookup[key:lower()] = key
+  settings.preset_sets = ensure_default_preset_sets(deserialize_preset_sets(get_ext_state("preset_sets", "")))
+  if not load_preset_set_into_settings(settings, settings.preset_name) then
+    if next(stored_presets) ~= nil then
+      settings.presets = merge_presets(DEFAULT_CATEGORY_TARGETS, stored_presets)
+      settings.preset_sets[settings.preset_name] = copy_presets(settings.presets)
+    else
+      settings.preset_name = "Default"
+      settings.presets = merge_presets(DEFAULT_CATEGORY_TARGETS, settings.preset_sets["Default"])
+    end
+    rebuild_preset_lookup(settings)
   end
 
   return settings
 end
 
 local function save_settings(settings)
+  settings.preset_name = sanitize_preset_name(settings.preset_name)
+  settings.preset_sets = ensure_default_preset_sets(settings.preset_sets)
+  settings.preset_sets[settings.preset_name] = copy_presets(settings.presets)
+  rebuild_preset_lookup(settings)
+
   reaper.SetExtState(EXT_SECTION, "normalize_mode", tostring(settings.normalize_mode), true)
   reaper.SetExtState(EXT_SECTION, "manual_target_db", tostring(settings.manual_target_db), true)
   reaper.SetExtState(EXT_SECTION, "silence_threshold_db", tostring(settings.silence_threshold_db), true)
@@ -377,6 +459,22 @@ local function save_settings(settings)
   reaper.SetExtState(EXT_SECTION, "lufs_hop_sec", tostring(settings.lufs_hop_sec), true)
   reaper.SetExtState(EXT_SECTION, "preset_name", tostring(settings.preset_name), true)
   reaper.SetExtState(EXT_SECTION, "category_presets", serialize_presets(settings.presets), true)
+  reaper.SetExtState(EXT_SECTION, "preset_sets", serialize_preset_sets(settings.preset_sets), true)
+end
+
+local function clone_settings(settings)
+  local copy = {}
+  for key, value in pairs(settings or {}) do
+    copy[key] = value
+  end
+
+  copy.presets = copy_presets(settings.presets or {})
+  copy.preset_sets = {}
+  for name, presets in pairs(settings.preset_sets or {}) do
+    copy.preset_sets[name] = copy_presets(presets)
+  end
+  rebuild_preset_lookup(copy)
+  return copy
 end
 
 local function prompt_for_settings(current)
@@ -1437,6 +1535,106 @@ local function build_normalize_plans(analyses, settings)
   return plans, groups, category_names
 end
 
+local function build_analysis_lookup(analyses)
+  local lookup = {}
+  for _, analysis in ipairs(analyses or {}) do
+    if analysis.item then
+      lookup[analysis.item] = analysis
+    end
+  end
+  return lookup
+end
+
+local function join_messages(parts, separator)
+  local items = {}
+  for _, value in ipairs(parts or {}) do
+    local text = trim_string(value)
+    if text ~= "" then
+      items[#items + 1] = text
+    end
+  end
+  return table.concat(items, separator or " | ")
+end
+
+local function determine_verification_flag(before_analysis, after_analysis, settings)
+  local plan = before_analysis.plan or {}
+  if not before_analysis.valid then
+    return "INVALID", before_analysis.error or "Pre-analysis failed.", nil
+  end
+  if not plan.will_apply then
+    return "SKIP", plan.skip_reason or "No gain change applied.", nil
+  end
+  if not after_analysis or not after_analysis.valid then
+    return "INVALID", (after_analysis and after_analysis.error) or "Post-analysis failed.", nil
+  end
+  if after_analysis.is_silent then
+    return "SILENT", "Item appears silent after normalize.", nil
+  end
+
+  local metric = plan.metric
+  local after_metric = get_metric_value(after_analysis, metric)
+  if not after_metric or after_metric <= NEG_INF_DB + 0.5 then
+    return "INVALID", "Post-analysis metric could not be measured.", nil
+  end
+
+  local residual_db = (plan.target_db or 0.0) - after_metric
+
+  if after_analysis.true_peak_dbfs > (settings.ceiling_dbfs + 0.05) then
+    return "CLIP", string.format("After peak %.1f dBFS exceeds ceiling %.1f dBFS.", after_analysis.true_peak_dbfs, settings.ceiling_dbfs), residual_db
+  end
+
+  if (plan.clip_warning or plan.clip_limited) and after_analysis.true_peak_dbfs >= (settings.ceiling_dbfs - 0.05) then
+    return "CLIP", string.format("After peak %.1f dBFS is at the ceiling.", after_analysis.true_peak_dbfs), residual_db
+  end
+
+  if plan.max_gain_limited and residual_db > settings.deadzone_db then
+    return "QUIET", string.format("Still %.1f dB below target after max gain cap.", residual_db), residual_db
+  end
+
+  if plan.max_cut_limited and residual_db < -settings.deadzone_db then
+    return "LOUD", string.format("Still %.1f dB above target after max cut cap.", -residual_db), residual_db
+  end
+
+  if math.abs(residual_db) <= settings.deadzone_db then
+    return "OK", string.format("Within %.1f dB deadzone after processing.", settings.deadzone_db), residual_db
+  end
+
+  if residual_db > settings.deadzone_db then
+    return "QUIET", string.format("Still %.1f dB below target after processing.", residual_db), residual_db
+  end
+
+  return "LOUD", string.format("Still %.1f dB above target after processing.", -residual_db), residual_db
+end
+
+local function attach_post_analysis(before_analyses, after_analyses, settings)
+  local after_lookup = build_analysis_lookup(after_analyses)
+  local counts = {}
+
+  for _, before_analysis in ipairs(before_analyses or {}) do
+    local after_analysis = before_analysis.item and after_lookup[before_analysis.item] or nil
+    local flag, note, residual_db = determine_verification_flag(before_analysis, after_analysis, settings)
+    before_analysis.after_analysis = after_analysis
+    before_analysis.verification_flag = flag
+    before_analysis.verification_note = note
+    before_analysis.actual_metric_after = after_analysis and before_analysis.plan and get_metric_value(after_analysis, before_analysis.plan.metric) or nil
+    before_analysis.actual_peak_after = after_analysis and after_analysis.true_peak_dbfs or nil
+    before_analysis.actual_residual_db = residual_db
+    before_analysis.status = flag or before_analysis.status
+    counts[flag or "UNKNOWN"] = (counts[flag or "UNKNOWN"] or 0) + 1
+  end
+
+  return after_lookup, counts
+end
+
+local function count_verification_flags(analyses)
+  local counts = {}
+  for _, analysis in ipairs(analyses or {}) do
+    local flag = analysis.verification_flag or analysis.status or "UNKNOWN"
+    counts[flag] = (counts[flag] or 0) + 1
+  end
+  return counts
+end
+
 local function range_from_values(values)
   local minimum = nil
   local maximum = nil
@@ -1534,6 +1732,7 @@ local function print_category_dashboard(groups, category_names, settings)
     local peak_values = {}
     local rms_values = {}
     local lufs_values = {}
+    local crest_values = {}
     local gain_values = {}
     local deadzone_count = 0
     local clip_count = 0
@@ -1544,6 +1743,7 @@ local function print_category_dashboard(groups, category_names, settings)
         peak_values[#peak_values + 1] = analysis.true_peak_dbfs
         rms_values[#rms_values + 1] = analysis.rms_dbfs
         lufs_values[#lufs_values + 1] = analysis.estimated_lufs
+        crest_values[#crest_values + 1] = analysis.crest_factor_db
         valid_measured = valid_measured + 1
       end
 
@@ -1562,6 +1762,7 @@ local function print_category_dashboard(groups, category_names, settings)
     local peak_min, peak_max = range_from_values(peak_values)
     local rms_min, rms_max = range_from_values(rms_values)
     local lufs_min, lufs_max = range_from_values(lufs_values)
+    local crest_min, crest_max = range_from_values(crest_values)
     local gain_min, gain_max = range_from_values(gain_values)
 
     log_line(string.format("  > %s (%d items) - Target: %s", category_name, #group.items, format_target(metric, target_db)))
@@ -1569,6 +1770,7 @@ local function print_category_dashboard(groups, category_names, settings)
     log_line(format_range_line("Peak Range", peak_min, peak_max, "dB"))
     log_line(format_range_line("RMS Range", rms_min, rms_max, "dB"))
     log_line(format_range_line("LUFS Range", lufs_min, lufs_max, "LUFS"))
+    log_line(format_range_line("Crest Range", crest_min, crest_max, "dB"))
     log_line(format_range_line("Gain Needed", gain_min, gain_max, "dB"))
 
     if deadzone_count > 0 then
@@ -1606,25 +1808,28 @@ local function print_detailed_item_list(analyses)
 
   log_line("  Detailed Item List")
   log_line("  -------------------------------------------------------------------------")
-  log_line(string.format("  %-3s %-16s %-24s %-7s %-7s %-7s %-7s %-10s", "#", "Category", "Name", "Peak", "RMS", "LUFS", "Gain", "Status"))
+  log_line(string.format("  %-3s %-16s %-22s %-7s %-7s %-7s %-7s %-7s %-10s", "#", "Category", "Name", "Peak", "RMS", "LUFS", "Crest", "Gain", "Status"))
   log_line("  -------------------------------------------------------------------------")
 
   for _, analysis in ipairs(sorted) do
     local plan = analysis.plan or {}
     local gain_text = plan.applied_gain_db and string.format("%+.1f", plan.applied_gain_db) or "-"
     log_line(string.format(
-      "  %-3d %-16s %-24s %-7s %-7s %-7s %-7s %-10s",
+      "  %-3d %-16s %-22s %-7s %-7s %-7s %-7s %-7s %-10s",
       analysis.item_index or 0,
       truncate_text(analysis.category or "Uncategorized", 16),
-      truncate_text(analysis.take_name or "Item", 24),
+      truncate_text(analysis.take_name or "Item", 22),
       format_db(analysis.true_peak_dbfs),
       format_db(analysis.rms_dbfs),
       format_db(analysis.estimated_lufs),
+      format_db(analysis.crest_factor_db),
       gain_text,
-      tostring(analysis.status or "n/a")
+      tostring(analysis.verification_flag or analysis.status or "n/a")
     ))
     if analysis.error then
       log_line("      Reason: " .. tostring(analysis.error))
+    elseif analysis.verification_note then
+      log_line("      Verify: " .. tostring(analysis.verification_note))
     elseif plan.skip_reason then
       log_line("      Reason: " .. tostring(plan.skip_reason))
     elseif plan.notes and #plan.notes > 0 then
@@ -1635,10 +1840,10 @@ local function print_detailed_item_list(analyses)
   log_line("  -------------------------------------------------------------------------")
 end
 
-local function print_before_after_preview(groups, category_names, settings)
+local function print_before_after_preview(groups, category_names, settings, after_lookup, title_override)
   log_line("")
   log_line("===========================================================================")
-  log_line(settings.dry_run and "  Predicted Normalization Preview" or "  Predicted Before / After")
+  log_line(title_override or (settings.dry_run and "  Predicted Normalization Preview" or "  Predicted Before / After"))
   log_line("===========================================================================")
 
   for _, category_name in ipairs(category_names) do
@@ -1654,7 +1859,10 @@ local function print_before_after_preview(groups, category_names, settings)
     for _, analysis in ipairs(group.items) do
       local plan = analysis.plan or {}
       local before_db = get_metric_value(analysis, metric)
-      local after_db = plan.predicted_metric_after or before_db
+      local post_analysis = after_lookup and after_lookup[analysis.item] or nil
+      local after_db = post_analysis and get_metric_value(post_analysis, metric) or plan.predicted_metric_after or before_db
+      local status = analysis.verification_flag or plan.status or analysis.status or "n/a"
+      local gain_label = string.format("%+.1f dB", plan.applied_gain_db or 0.0)
       if before_db and before_db > NEG_INF_DB + 0.5 then
         before_values[#before_values + 1] = before_db
       end
@@ -1666,8 +1874,8 @@ local function print_before_after_preview(groups, category_names, settings)
         truncate_text(analysis.take_name or "Item", 24),
         format_db(before_db),
         format_db(after_db),
-        string.format("%+.1f dB", plan.applied_gain_db or 0.0),
-        tostring(plan.status or analysis.status or "n/a")
+        gain_label,
+        tostring(status)
       ))
     end
 
@@ -1758,6 +1966,7 @@ end
 
 local function print_action_summary(analyses, runtime_summary, settings)
   local plan_summary = count_plan_statuses(analyses)
+  local verification_counts = runtime_summary and runtime_summary.verification_counts or count_verification_flags(analyses)
 
   log_line("===========================================================================")
   log_line(settings.dry_run and "  Dry Run Complete" or "  Normalization Complete")
@@ -1766,6 +1975,13 @@ local function print_action_summary(analyses, runtime_summary, settings)
   log_line(string.format("  Items to cut:            %d", plan_summary.cut))
   log_line(string.format("  Items to skip:           %d", plan_summary.skip))
   log_line(string.format("  Items with clip flag:    %d", plan_summary.clip))
+  if verification_counts and next(verification_counts) ~= nil then
+    log_line(string.format("  Verify OK:               %d", verification_counts.OK or 0))
+    log_line(string.format("  Verify SKIP:             %d", verification_counts.SKIP or 0))
+    log_line(string.format("  Verify QUIET:            %d", verification_counts.QUIET or 0))
+    log_line(string.format("  Verify LOUD:             %d", verification_counts.LOUD or 0))
+    log_line(string.format("  Verify CLIP:             %d", verification_counts.CLIP or 0))
+  end
   if not settings.dry_run then
     log_line(string.format("  Plans applied:           %d", runtime_summary.processed_count or 0))
     log_line(string.format("  Plans skipped:           %d", runtime_summary.skipped_count or 0))
@@ -1773,9 +1989,976 @@ local function print_action_summary(analyses, runtime_summary, settings)
   log_line("===========================================================================")
 end
 
-local function main()
+local function print_full_report(analyses, groups, category_names, settings, runtime_summary, after_lookup, title_override)
+  reaper.ClearConsole()
+  print_settings_summary(settings, analyses, category_names)
+  print_category_dashboard(groups, category_names, settings)
+  print_detailed_item_list(analyses)
+  print_before_after_preview(groups, category_names, settings, after_lookup, title_override)
+  if runtime_summary then
+    print_action_summary(analyses, runtime_summary, settings)
+  end
+end
+
+local function csv_escape(value)
+  local text = tostring(value == nil and "" or value)
+  if text:find('[,"\r\n]') then
+    text = '"' .. text:gsub('"', '""') .. '"'
+  end
+  return text
+end
+
+local function get_project_directory()
+  local _, project_path = reaper.EnumProjects(-1, "")
+  project_path = trim_string(project_path)
+  if project_path ~= "" then
+    return project_path:match("^(.*)[/\\][^/\\]+$") or project_path
+  end
+
+  if reaper.GetProjectPathEx then
+    local project_dir = trim_string(reaper.GetProjectPathEx(0))
+    if project_dir ~= "" then
+      return project_dir
+    end
+  end
+
+  return trim_string(reaper.GetResourcePath and reaper.GetResourcePath() or "")
+end
+
+local function join_path(left, right)
+  local lhs = trim_string(left):gsub("/", "\\")
+  local rhs = trim_string(right):gsub("/", "\\")
+  if lhs == "" then
+    return rhs
+  end
+  if rhs == "" then
+    return lhs
+  end
+  return lhs:gsub("\\+$", "") .. "\\" .. rhs:gsub("^\\+", "")
+end
+
+local function prompt_export_path(default_path)
+  local ok, value = reaper.GetUserInputs(SCRIPT_TITLE, 1, "CSV Export Path", default_path)
+  if not ok then
+    return nil, "User cancelled."
+  end
+
+  local path = trim_string(value)
+  if path == "" then
+    return nil, "Export path cannot be empty."
+  end
+  return path
+end
+
+local function build_report_rows(analyses, after_lookup)
+  local sorted = shallow_copy_list(analyses or {})
+  table.sort(sorted, function(left, right)
+    local left_category = tostring(left.category or ""):lower()
+    local right_category = tostring(right.category or ""):lower()
+    if left_category ~= right_category then
+      return left_category < right_category
+    end
+    local left_name = tostring(left.take_name or ""):lower()
+    local right_name = tostring(right.take_name or ""):lower()
+    if left_name ~= right_name then
+      return left_name < right_name
+    end
+    return (left.item_index or 0) < (right.item_index or 0)
+  end)
+
+  local rows = {}
+  for _, analysis in ipairs(sorted) do
+    local plan = analysis.plan or {}
+    local after_analysis = after_lookup and after_lookup[analysis.item] or analysis.after_analysis
+    local target_metric = plan.metric or analysis.target_metric or ""
+    local actual_after_metric = after_analysis and target_metric ~= "" and get_metric_value(after_analysis, target_metric) or nil
+    local residual_db = analysis.actual_residual_db
+    if residual_db == nil and actual_after_metric and plan.target_db ~= nil then
+      residual_db = plan.target_db - actual_after_metric
+    end
+
+    rows[#rows + 1] = {
+      analysis.item_index or "",
+      analysis.category or "",
+      analysis.take_name or "",
+      analysis.category_source or "",
+      target_metric,
+      plan.target_db or analysis.target_db or "",
+      analysis.true_peak_dbfs,
+      analysis.rms_dbfs,
+      analysis.estimated_lufs,
+      analysis.crest_factor_db,
+      plan.requested_gain_db or analysis.requested_gain_db or "",
+      plan.applied_gain_db or analysis.target_gain_db or "",
+      plan.predicted_peak_after or analysis.predicted_peak_after or "",
+      plan.predicted_metric_after or analysis.predicted_metric_after or "",
+      after_analysis and after_analysis.true_peak_dbfs or "",
+      after_analysis and after_analysis.rms_dbfs or "",
+      after_analysis and after_analysis.estimated_lufs or "",
+      after_analysis and after_analysis.crest_factor_db or "",
+      residual_db or "",
+      analysis.verification_flag or analysis.status or "",
+      analysis.verification_note or plan.skip_reason or join_messages(plan.notes, " / "),
+    }
+  end
+
+  return rows
+end
+
+local function export_report_to_csv(report_context)
+  local project_dir = get_project_directory()
+  local suggested_name = string.format(
+    "GameSoundLoudnessReport_%s_%s.csv",
+    sanitize_preset_name(report_context.settings.preset_name or "Default"):gsub("%s+", "_"),
+    os.date("%Y%m%d_%H%M%S")
+  )
+  local default_path = join_path(project_dir, suggested_name)
+  local export_path, err = prompt_export_path(default_path)
+  if not export_path then
+    return false, err
+  end
+
+  local export_dir = export_path:match("^(.*)[/\\][^/\\]+$")
+  if export_dir and export_dir ~= "" then
+    reaper.RecursiveCreateDirectory(export_dir, 0)
+  end
+
+  local file, open_err = io.open(export_path, "w")
+  if not file then
+    return false, open_err or "Failed to open CSV for writing."
+  end
+
+  local headers = {
+    "Index",
+    "Category",
+    "Name",
+    "CategorySource",
+    "Metric",
+    "TargetDb",
+    "BeforePeakDb",
+    "BeforeRmsDb",
+    "BeforeLufs",
+    "BeforeCrestDb",
+    "RequestedGainDb",
+    "AppliedGainDb",
+    "PredictedPeakAfterDb",
+    "PredictedMetricAfterDb",
+    "AfterPeakDb",
+    "AfterRmsDb",
+    "AfterLufs",
+    "AfterCrestDb",
+    "ResidualDb",
+    "Status",
+    "Notes",
+  }
+
+  file:write(table.concat(headers, ",") .. "\n")
+  for _, row in ipairs(build_report_rows(report_context.analyses, report_context.after_lookup)) do
+    local escaped = {}
+    for index = 1, #row do
+      escaped[index] = csv_escape(row[index])
+    end
+    file:write(table.concat(escaped, ",") .. "\n")
+  end
+  file:close()
+
+  return true, export_path
+end
+
+local function clamp_number(value, min_value, max_value)
+  if value < min_value then
+    return min_value
+  end
+  if value > max_value then
+    return max_value
+  end
+  return value
+end
+
+local function point_in_rect(x, y, rect_x, rect_y, rect_w, rect_h)
+  return x >= rect_x and x <= (rect_x + rect_w) and y >= rect_y and y <= (rect_y + rect_h)
+end
+
+local function calculate_average_metric(analyses, metric)
+  local sum = 0.0
+  local count = 0
+  for _, analysis in ipairs(analyses or {}) do
+    if analysis.valid and not analysis.is_silent then
+      local value = get_metric_value(analysis, metric)
+      if value and value > NEG_INF_DB + 0.5 then
+        sum = sum + value
+        count = count + 1
+      end
+    end
+  end
+
+  if count <= 0 then
+    return nil
+  end
+  return sum / count
+end
+
+local function get_category_statistics(group, settings)
+  local metric, target_db = get_target_for_category(group.name, settings)
+  local average_db = calculate_average_metric(group.items, metric)
+  local peak_average = calculate_average_metric(group.items, "peak")
+  local rms_average = calculate_average_metric(group.items, "rms")
+  local lufs_average = calculate_average_metric(group.items, "lufs")
+
+  return {
+    metric = metric,
+    target_db = target_db,
+    average_db = average_db,
+    peak_average = peak_average,
+    rms_average = rms_average,
+    lufs_average = lufs_average,
+    item_count = #group.items,
+    delta_db = average_db and (target_db - average_db) or nil,
+  }
+end
+
+local function refresh_analysis_state(ui, settings)
   local selected_items = collect_selected_items()
   if #selected_items == 0 then
+    ui.selected_items = {}
+    ui.analyses = {}
+    ui.groups = {}
+    ui.category_names = {}
+    ui.plans = {}
+    return false, "Select one or more audio items."
+  end
+
+  local analyses = analyze_selected_items(selected_items, settings)
+  local plans, groups, category_names = build_normalize_plans(analyses, settings)
+
+  ui.selected_items = selected_items
+  ui.analyses = analyses
+  ui.groups = groups
+  ui.category_names = category_names
+  ui.plans = plans
+  if #category_names > 0 and (not ui.selected_category or not groups[ui.selected_category]) then
+    ui.selected_category = category_names[1]
+  end
+  ui.table_scroll = clamp_number(ui.table_scroll or 0, 0, math.max(0, #category_names - 1))
+
+  return true, string.format("Analyzed %d item(s) across %d categor%s.", #analyses, #category_names, #category_names == 1 and "y" or "ies")
+end
+
+local function save_current_preset_set(settings, preset_name)
+  local normalized_name = sanitize_preset_name(preset_name)
+  settings.preset_name = normalized_name
+  settings.preset_sets = ensure_default_preset_sets(settings.preset_sets)
+  settings.preset_sets[normalized_name] = copy_presets(settings.presets)
+  save_settings(settings)
+  return normalized_name
+end
+
+local function prompt_preset_name(default_name)
+  local ok, value = reaper.GetUserInputs(SCRIPT_TITLE, 1, "Preset Set Name", sanitize_preset_name(default_name or "Custom"))
+  if not ok then
+    return nil, "User cancelled."
+  end
+
+  local preset_name = sanitize_preset_name(value)
+  if preset_name == "" then
+    return nil, "Preset name cannot be empty."
+  end
+  return preset_name
+end
+
+local function prompt_category_target(category_name, preset_data)
+  local default_metric = preset_data and preset_data.metric or "peak"
+  local default_target = preset_data and preset_data.target or get_default_manual_target(default_metric)
+  local captions = table.concat({
+    "separator=|",
+    "Category Key",
+    "Metric (peak/rms/lufs)",
+    "Target dB",
+  }, ",")
+  local defaults = table.concat({
+    sanitize_category_key(category_name or ""),
+    tostring(default_metric),
+    tostring(default_target),
+  }, "|")
+
+  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE, 3, captions, defaults)
+  if not ok then
+    return nil, "User cancelled."
+  end
+
+  local parts = split_delimited(values, "|", 3)
+  local edited_category = sanitize_category_key(parts[1])
+  local metric = parse_normalize_mode(parts[2])
+  local target_db = tonumber(parts[3])
+
+  if edited_category == "" then
+    return nil, "Category key cannot be empty."
+  end
+  if metric == "auto" or not metric then
+    return nil, "Metric must be peak, rms, or lufs."
+  end
+  if not target_db or target_db > 6 or target_db < -150 then
+    return nil, "Target must be between -150 and +6 dB."
+  end
+
+  return {
+    category = edited_category,
+    metric = metric,
+    target = round_to(target_db, 3),
+  }
+end
+
+local function delete_category_target(settings, category_name)
+  if DEFAULT_CATEGORY_TARGETS[category_name] then
+    settings.presets[category_name] = copy_presets(DEFAULT_CATEGORY_TARGETS)[category_name]
+    return "Reset category to built-in default."
+  end
+
+  settings.presets[category_name] = nil
+  rebuild_preset_lookup(settings)
+  return "Deleted custom category target."
+end
+
+local function get_sorted_preset_names(settings)
+  settings.preset_sets = ensure_default_preset_sets(settings.preset_sets)
+  local names = {}
+  for name in pairs(settings.preset_sets or {}) do
+    names[#names + 1] = name
+  end
+  sort_strings_case_insensitive(names)
+  return names
+end
+
+local function choose_preset_set_from_menu(settings)
+  local names = get_sorted_preset_names(settings)
+  if #names == 0 then
+    return nil
+  end
+
+  local menu_items = {}
+  for _, name in ipairs(names) do
+    if name == settings.preset_name then
+      menu_items[#menu_items + 1] = "!" .. name
+    else
+      menu_items[#menu_items + 1] = name
+    end
+  end
+
+  gfx.x = gfx.mouse_x
+  gfx.y = gfx.mouse_y
+  local selection = gfx.showmenu(table.concat(menu_items, "|"))
+  if selection and selection > 0 then
+    return names[selection]
+  end
+
+  return nil
+end
+
+local function create_report_context(analyses, groups, category_names, settings, runtime_summary, after_analyses, after_lookup, title_override)
+  return {
+    analyses = analyses,
+    groups = groups,
+    category_names = category_names,
+    settings = clone_settings(settings),
+    runtime_summary = runtime_summary,
+    after_analyses = after_analyses,
+    after_lookup = after_lookup,
+    title_override = title_override,
+  }
+end
+
+local function run_preview(ui, settings)
+  local ok, message = refresh_analysis_state(ui, settings)
+  if not ok then
+    return false, message
+  end
+
+  local preview_settings = clone_settings(settings)
+  preview_settings.dry_run = true
+  local runtime_summary = {
+    processed_count = 0,
+    skipped_count = 0,
+    clip_count = 0,
+    verification_counts = count_verification_flags(ui.analyses),
+  }
+  print_full_report(
+    ui.analyses,
+    ui.groups,
+    ui.category_names,
+    preview_settings,
+    runtime_summary,
+    nil,
+    "  Predicted Normalization Preview"
+  )
+  ui.last_report_context = create_report_context(
+    ui.analyses,
+    ui.groups,
+    ui.category_names,
+    preview_settings,
+    runtime_summary,
+    nil,
+    nil,
+    "  Predicted Normalization Preview"
+  )
+  return true, "Dry run preview sent to the ReaScript console."
+end
+
+local function run_normalize(ui, settings)
+  local ok, message = refresh_analysis_state(ui, settings)
+  if not ok then
+    return false, message
+  end
+
+  local run_settings = clone_settings(settings)
+  run_settings.dry_run = false
+  local before_analyses = ui.analyses
+  local before_groups = ui.groups
+  local before_category_names = ui.category_names
+
+  local processed_ok, runtime_summary_or_error = process_plans(ui.plans, ui.selected_items, run_settings)
+  if not processed_ok then
+    return false, runtime_summary_or_error
+  end
+
+  local after_analyses = analyze_selected_items(ui.selected_items, run_settings)
+  local after_lookup, verification_counts = attach_post_analysis(before_analyses, after_analyses, run_settings)
+  runtime_summary_or_error.after_analyses = after_analyses
+  runtime_summary_or_error.after_lookup = after_lookup
+  runtime_summary_or_error.verification_counts = verification_counts
+
+  print_full_report(
+    before_analyses,
+    before_groups,
+    before_category_names,
+    run_settings,
+    runtime_summary_or_error,
+    after_lookup,
+    "  Normalization Results - Before / After"
+  )
+
+  ui.last_report_context = create_report_context(
+    before_analyses,
+    before_groups,
+    before_category_names,
+    run_settings,
+    runtime_summary_or_error,
+    after_analyses,
+    after_lookup,
+    "  Normalization Results - Before / After"
+  )
+
+  refresh_analysis_state(ui, settings)
+  return true, string.format("Normalized %d item(s).", runtime_summary_or_error.processed_count or 0)
+end
+
+local UI_COLORS = {
+  bg = { 0.08, 0.10, 0.12, 1.0 },
+  panel = { 0.11, 0.13, 0.16, 1.0 },
+  panel_alt = { 0.14, 0.17, 0.20, 1.0 },
+  border = { 0.27, 0.34, 0.40, 1.0 },
+  text = { 0.93, 0.95, 0.97, 1.0 },
+  text_dim = { 0.63, 0.70, 0.76, 1.0 },
+  accent = { 0.17, 0.57, 0.49, 1.0 },
+  accent_hover = { 0.20, 0.66, 0.56, 1.0 },
+  warning = { 0.82, 0.60, 0.20, 1.0 },
+  danger = { 0.73, 0.29, 0.28, 1.0 },
+  info = { 0.25, 0.48, 0.72, 1.0 },
+  row = { 0.13, 0.15, 0.18, 1.0 },
+  row_hover = { 0.17, 0.20, 0.24, 1.0 },
+  row_selected = { 0.18, 0.29, 0.31, 1.0 },
+}
+
+local function ui_set_color(color)
+  gfx.set(color[1], color[2], color[3], color[4] or 1.0)
+end
+
+local function ui_draw_rect(x, y, w, h, color, fill)
+  ui_set_color(color)
+  gfx.rect(x, y, w, h, fill and 1 or 0)
+end
+
+local function ui_draw_text(font_index, x, y, text, color)
+  ui_set_color(color or UI_COLORS.text)
+  gfx.setfont(font_index or 1)
+  gfx.x = x
+  gfx.y = y
+  gfx.drawstr(tostring(text or ""))
+end
+
+local function ui_draw_panel(x, y, w, h, title)
+  ui_draw_rect(x, y, w, h, UI_COLORS.panel, true)
+  ui_draw_rect(x, y, w, h, UI_COLORS.border, false)
+  if title and title ~= "" then
+    ui_draw_text(1, x + 14, y + 10, title, UI_COLORS.text)
+  end
+end
+
+local function ui_draw_button(ui, x, y, w, h, label, fill_color)
+  local hovered = point_in_rect(ui.mouse_x, ui.mouse_y, x, y, w, h)
+  local color = fill_color or UI_COLORS.panel_alt
+  if hovered then
+    color = {
+      clamp_number(color[1] + 0.04, 0, 1),
+      clamp_number(color[2] + 0.04, 0, 1),
+      clamp_number(color[3] + 0.04, 0, 1),
+      color[4],
+    }
+  end
+
+  ui_draw_rect(x, y, w, h, color, true)
+  ui_draw_rect(x, y, w, h, UI_COLORS.border, false)
+  gfx.setfont(2)
+  local text_w, text_h = gfx.measurestr(label or "")
+  ui_draw_text(2, x + ((w - text_w) * 0.5), y + ((h - text_h) * 0.5), label, UI_COLORS.text)
+
+  return hovered and ui.mouse_clicked
+end
+
+local function ui_draw_summary_card(x, y, w, h, title, value, accent_color)
+  ui_draw_rect(x, y, w, h, UI_COLORS.panel_alt, true)
+  ui_draw_rect(x, y, w, h, UI_COLORS.border, false)
+  ui_draw_rect(x, y, w, 4, h, accent_color or UI_COLORS.accent, true)
+  ui_draw_text(2, x + 16, y + 12, title, UI_COLORS.text_dim)
+  ui_draw_text(3, x + 16, y + 34, value, UI_COLORS.text)
+end
+
+local function ui_draw_delta_bar(x, y, w, h, delta_db)
+  ui_draw_rect(x, y, w, h, { 0.10, 0.12, 0.14, 1.0 }, true)
+  local mid_x = x + (w * 0.5)
+  ui_draw_rect(mid_x, y, 1, h, UI_COLORS.border, true)
+  if not delta_db then
+    return
+  end
+
+  local clamped = clamp_number(delta_db, -12.0, 12.0)
+  local half_w = (w * 0.5) - 2
+  local pixels = math.abs(clamped / 12.0) * half_w
+  local color = clamped >= 0 and UI_COLORS.accent or UI_COLORS.danger
+
+  if clamped >= 0 then
+    ui_draw_rect(mid_x, y + 2, pixels, h - 4, color, true)
+  else
+    ui_draw_rect(mid_x - pixels, y + 2, pixels, h - 4, color, true)
+  end
+end
+
+local function handle_settings_action(ui, settings)
+  local updated, err = prompt_for_settings(settings)
+  if not updated then
+    return false, err
+  end
+
+  updated.presets = settings.presets
+  updated.preset_sets = settings.preset_sets
+  updated.preset_name = settings.preset_name
+  rebuild_preset_lookup(updated)
+
+  for key, value in pairs(updated) do
+    settings[key] = value
+  end
+
+  save_settings(settings)
+  return refresh_analysis_state(ui, settings)
+end
+
+local function handle_edit_target_action(ui, settings, default_category)
+  local category_name = default_category or ui.selected_category or "Uncategorized"
+  local preset_data = settings.presets[category_name] or DEFAULT_CATEGORY_TARGETS[category_name]
+  local edited, err = prompt_category_target(category_name, preset_data)
+  if not edited then
+    return false, err
+  end
+
+  settings.presets[edited.category] = {
+    metric = edited.metric,
+    target = edited.target,
+  }
+  if default_category and default_category ~= edited.category and settings.presets[default_category]
+    and not DEFAULT_CATEGORY_TARGETS[default_category] then
+    settings.presets[default_category] = nil
+  end
+  rebuild_preset_lookup(settings)
+  save_settings(settings)
+  ui.selected_category = edited.category
+
+  if #ui.analyses > 0 then
+    local _, groups, category_names = build_normalize_plans(ui.analyses, settings)
+    ui.groups = groups
+    ui.category_names = category_names
+  end
+
+  return true, string.format("Updated target for %s.", edited.category)
+end
+
+local function handle_delete_target_action(ui, settings)
+  local category_name = ui.selected_category
+  if not category_name then
+    return false, "Select a category first."
+  end
+
+  local response = reaper.ShowMessageBox("Reset/delete target for " .. category_name .. "?", SCRIPT_TITLE, 4)
+  if response ~= 6 then
+    return false, "User cancelled."
+  end
+
+  local message = delete_category_target(settings, category_name)
+  save_settings(settings)
+  if #ui.analyses > 0 then
+    local _, groups, category_names = build_normalize_plans(ui.analyses, settings)
+    ui.groups = groups
+    ui.category_names = category_names
+  end
+  return true, message
+end
+
+local function handle_save_preset_action(settings)
+  local preset_name, err = prompt_preset_name(settings.preset_name)
+  if not preset_name then
+    return false, err
+  end
+
+  local saved_name = save_current_preset_set(settings, preset_name)
+  return true, string.format("Saved preset set '%s'.", saved_name)
+end
+
+local function handle_load_preset_action(ui, settings)
+  local preset_name = choose_preset_set_from_menu(settings)
+  if not preset_name then
+    return false, "User cancelled."
+  end
+
+  if not load_preset_set_into_settings(settings, preset_name) then
+    return false, "Could not load preset set."
+  end
+
+  save_settings(settings)
+  return refresh_analysis_state(ui, settings)
+end
+
+local function handle_export_report_action(ui, settings)
+  local report_context = ui.last_report_context
+  if not report_context then
+    local ok, message = refresh_analysis_state(ui, settings)
+    if not ok then
+      return false, message
+    end
+
+    local preview_settings = clone_settings(settings)
+    preview_settings.dry_run = true
+    report_context = create_report_context(
+      ui.analyses,
+      ui.groups,
+      ui.category_names,
+      preview_settings,
+      {
+        processed_count = 0,
+        skipped_count = 0,
+        clip_count = 0,
+        verification_counts = count_verification_flags(ui.analyses),
+      },
+      nil,
+      nil,
+      "  Predicted Normalization Preview"
+    )
+    ui.last_report_context = report_context
+  end
+
+  local ok, path_or_error = export_report_to_csv(report_context)
+  if not ok then
+    return false, path_or_error
+  end
+
+  return true, "CSV report exported to " .. path_or_error
+end
+
+local function draw_category_table(ui, settings, x, y, w, h)
+  ui_draw_panel(x, y, w, h, "Category Targets")
+
+  local header_y = y + 42
+  ui_draw_text(2, x + 14, header_y, "Category", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 210, header_y, "Metric", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 300, header_y, "Target", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 390, header_y, "Items", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 460, header_y, "Average", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 560, header_y, "Delta", UI_COLORS.text_dim)
+
+  local table_y = header_y + 24
+  local row_h = 28
+  local visible_rows = math.max(1, math.floor((h - 84) / row_h))
+  local max_scroll = math.max(0, #ui.category_names - visible_rows)
+
+  if point_in_rect(ui.mouse_x, ui.mouse_y, x, y, w, h) and ui.wheel_steps ~= 0 then
+    ui.table_scroll = clamp_number((ui.table_scroll or 0) - ui.wheel_steps, 0, max_scroll)
+  end
+
+  local start_index = (ui.table_scroll or 0) + 1
+  local end_index = math.min(#ui.category_names, start_index + visible_rows - 1)
+
+  for index = start_index, end_index do
+    local category_name = ui.category_names[index]
+    local row_y = table_y + ((index - start_index) * row_h)
+    local group = ui.groups[category_name]
+    local stats = get_category_statistics(group, settings)
+    local selected = ui.selected_category == category_name
+    local hovered = point_in_rect(ui.mouse_x, ui.mouse_y, x + 8, row_y, w - 16, row_h - 2)
+
+    if selected then
+      ui_draw_rect(x + 8, row_y, w - 16, row_h - 2, UI_COLORS.row_selected, true)
+    elseif hovered then
+      ui_draw_rect(x + 8, row_y, w - 16, row_h - 2, UI_COLORS.row_hover, true)
+    else
+      ui_draw_rect(x + 8, row_y, w - 16, row_h - 2, UI_COLORS.row, true)
+    end
+
+    if hovered and ui.mouse_clicked then
+      ui.selected_category = category_name
+    end
+
+    ui_draw_text(2, x + 14, row_y + 6, truncate_text(category_name, 24), UI_COLORS.text)
+    ui_draw_text(2, x + 210, row_y + 6, HUMAN_METRIC[stats.metric] or stats.metric, UI_COLORS.text)
+    ui_draw_text(2, x + 300, row_y + 6, string.format("%.1f", stats.target_db), UI_COLORS.text)
+    ui_draw_text(2, x + 390, row_y + 6, tostring(stats.item_count), UI_COLORS.text)
+    ui_draw_text(2, x + 460, row_y + 6, stats.average_db and format_db(stats.average_db) or "n/a", UI_COLORS.text)
+    ui_draw_delta_bar(x + 560, row_y + 5, 180, 16, stats.delta_db)
+  end
+
+  if max_scroll > 0 then
+    ui_draw_text(2, x + w - 180, y + h - 24, string.format("Scroll %d / %d", (ui.table_scroll or 0) + 1, max_scroll + 1), UI_COLORS.text_dim)
+  end
+end
+
+local function draw_selected_category_panel(ui, settings, x, y, w, h)
+  ui_draw_panel(x, y, w, h, "Selected Category")
+
+  local category_name = ui.selected_category
+  local group = category_name and ui.groups[category_name] or nil
+  if not category_name or not group then
+    ui_draw_text(2, x + 16, y + 48, "No category selected.", UI_COLORS.text_dim)
+    return
+  end
+
+  local stats = get_category_statistics(group, settings)
+  local preset = settings.presets[category_name] or DEFAULT_CATEGORY_TARGETS[category_name]
+  local crest_average = (stats.peak_average and stats.rms_average) and ((stats.peak_average or 0.0) - (stats.rms_average or 0.0)) or nil
+
+  ui_draw_text(3, x + 16, y + 42, truncate_text(category_name, 22), UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 84, "Metric", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 84, HUMAN_METRIC[preset.metric] or preset.metric, UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 112, "Target", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 112, string.format("%.1f", preset.target), UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 140, "Items", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 140, tostring(stats.item_count), UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 168, "Avg Peak", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 168, stats.peak_average and format_db(stats.peak_average) or "n/a", UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 196, "Avg RMS", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 196, stats.rms_average and format_db(stats.rms_average) or "n/a", UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 224, "Avg LUFS", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 224, stats.lufs_average and format_db(stats.lufs_average) or "n/a", UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 252, "Avg Crest", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 252, crest_average and format_db(crest_average) or "n/a", UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 280, "Category Avg", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 280, stats.average_db and format_db(stats.average_db) or "n/a", UI_COLORS.text)
+  ui_draw_text(2, x + 16, y + 308, "Delta", UI_COLORS.text_dim)
+  ui_draw_text(2, x + 120, y + 308, stats.delta_db and string.format("%+.1f dB", stats.delta_db) or "n/a", UI_COLORS.text)
+
+  ui_draw_text(2, x + 16, y + 342, "Delta Preview", UI_COLORS.text_dim)
+  ui_draw_delta_bar(x + 16, y + 366, w - 32, 22, stats.delta_db)
+
+  if ui_draw_button(ui, x + 16, y + h - 142, w - 32, 30, "Edit Target", UI_COLORS.info) then
+    local ok, message = handle_edit_target_action(ui, settings)
+    ui.status_message = ok and message or (message ~= "User cancelled." and ("Error: " .. message) or ui.status_message)
+  end
+
+  if ui_draw_button(ui, x + 16, y + h - 102, w - 32, 30, "Add Target", UI_COLORS.accent) then
+    local ok, message = handle_edit_target_action(ui, settings, "")
+    ui.status_message = ok and message or (message ~= "User cancelled." and ("Error: " .. message) or ui.status_message)
+  end
+
+  if ui_draw_button(ui, x + 16, y + h - 62, w - 32, 30, "Reset / Delete Target", UI_COLORS.warning) then
+    local ok, message = handle_delete_target_action(ui, settings)
+    ui.status_message = ok and message or (message ~= "User cancelled." and ("Error: " .. message) or ui.status_message)
+  end
+end
+
+local function draw_dashboard(ui, settings)
+  ui_draw_rect(0, 0, gfx.w, gfx.h, UI_COLORS.bg, true)
+  ui_draw_rect(0, 0, gfx.w, 58, UI_COLORS.panel_alt, true)
+  ui_draw_text(3, 18, 14, SCRIPT_TITLE, UI_COLORS.text)
+  ui_draw_text(2, gfx.w - 330, 20, "A Analyze | D Dry Run | N Normalize | E Export | Esc Close", UI_COLORS.text_dim)
+
+  local settings_clicked = ui_draw_button(ui, 20, 72, 110, 32, "Settings", UI_COLORS.info)
+  local analyze_clicked = ui_draw_button(ui, 140, 72, 140, 32, "Analyze Selected", UI_COLORS.accent)
+  local load_clicked = ui_draw_button(ui, 290, 72, 120, 32, "Load Preset", UI_COLORS.panel_alt)
+  local save_clicked = ui_draw_button(ui, 420, 72, 120, 32, "Save Preset", UI_COLORS.panel_alt)
+  local export_clicked = ui_draw_button(ui, 550, 72, 130, 32, "Export Report", UI_COLORS.warning)
+
+  local card_y = 118
+  ui_draw_summary_card(20, card_y, 180, 76, "Selected Items", tostring(#ui.selected_items or 0), UI_COLORS.accent)
+  ui_draw_summary_card(214, card_y, 180, 76, "Categories", tostring(#ui.category_names or 0), UI_COLORS.info)
+  ui_draw_summary_card(408, card_y, 220, 76, "Normalize Mode", settings.normalize_mode, UI_COLORS.warning)
+  ui_draw_summary_card(642, card_y, 220, 76, "Preset Set", settings.preset_name or "Default", UI_COLORS.accent)
+  ui_draw_summary_card(876, card_y, 280, 76, "Balance / Ceiling", string.format("%s / %.1f dBFS", settings.balance_mode, settings.ceiling_dbfs), UI_COLORS.danger)
+
+  draw_category_table(ui, settings, 20, 212, 800, 474)
+  draw_selected_category_panel(ui, settings, 840, 212, 340, 474)
+
+  local dry_run_clicked = ui_draw_button(ui, 20, 704, 160, 36, "Dry Run Preview", UI_COLORS.warning)
+  local normalize_clicked = ui_draw_button(ui, 190, 704, 160, 36, "Normalize All", UI_COLORS.accent)
+  local export_bottom_clicked = ui_draw_button(ui, 360, 704, 160, 36, "Export CSV", UI_COLORS.info)
+  local close_clicked = ui_draw_button(ui, gfx.w - 140, 704, 120, 36, "Close", UI_COLORS.danger)
+
+  ui_draw_rect(20, 748, gfx.w - 40, 22, UI_COLORS.panel_alt, true)
+  ui_draw_rect(20, 748, gfx.w - 40, 22, UI_COLORS.border, false)
+  ui_draw_text(2, 28, 752, ui.status_message or "Ready.", UI_COLORS.text_dim)
+
+  if settings_clicked then
+    local ok, message = handle_settings_action(ui, settings)
+    if ok then
+      ui.status_message = message
+    elseif message and message ~= "User cancelled." then
+      ui.status_message = "Error: " .. message
+    end
+  end
+
+  if analyze_clicked then
+    local ok, message = refresh_analysis_state(ui, settings)
+    ui.status_message = ok and message or ("Error: " .. tostring(message))
+  end
+
+  if load_clicked then
+    local ok, message = handle_load_preset_action(ui, settings)
+    if ok then
+      ui.status_message = message
+    elseif message and message ~= "User cancelled." then
+      ui.status_message = "Error: " .. message
+    end
+  end
+
+  if save_clicked then
+    local ok, message = handle_save_preset_action(settings)
+    if ok then
+      ui.status_message = message
+    elseif message and message ~= "User cancelled." then
+      ui.status_message = "Error: " .. message
+    end
+  end
+
+  if export_clicked or export_bottom_clicked then
+    local ok, message = handle_export_report_action(ui, settings)
+    if ok then
+      ui.status_message = message
+    elseif message and message ~= "User cancelled." then
+      ui.status_message = "Error: " .. message
+    end
+  end
+
+  if dry_run_clicked then
+    local ok, message = run_preview(ui, settings)
+    ui.status_message = ok and message or ("Error: " .. tostring(message))
+  end
+
+  if normalize_clicked then
+    local ok, message = run_normalize(ui, settings)
+    ui.status_message = ok and message or ("Error: " .. tostring(message))
+  end
+
+  return close_clicked
+end
+
+local function run_gfx_dashboard(settings)
+  if not gfx or not gfx.init then
+    reaper.ShowMessageBox("gfx API is not available in this REAPER build.", SCRIPT_TITLE, 0)
+    return
+  end
+
+  local ui = {
+    width = 1200,
+    height = 780,
+    mouse_x = 0,
+    mouse_y = 0,
+    mouse_down = false,
+    prev_mouse_down = false,
+    mouse_clicked = false,
+    wheel_steps = 0,
+    last_wheel = 0,
+    table_scroll = 0,
+    status_message = "Opening dashboard...",
+    selected_items = {},
+    analyses = {},
+    groups = {},
+    category_names = {},
+    plans = {},
+    selected_category = nil,
+    last_report_context = nil,
+  }
+
+  local ok, message = refresh_analysis_state(ui, settings)
+  ui.status_message = ok and message or ("Error: " .. tostring(message))
+
+  gfx.init(SCRIPT_TITLE, ui.width, ui.height, 0)
+  if (gfx.w or 0) <= 0 then
+    return
+  end
+
+  gfx.setfont(1, "Segoe UI", 16)
+  gfx.setfont(2, "Segoe UI", 13)
+  gfx.setfont(3, "Segoe UI", 22)
+
+  local function loop()
+    local char = gfx.getchar()
+    if char < 0 or char == 27 then
+      gfx.quit()
+      return
+    end
+
+    ui.mouse_x = gfx.mouse_x
+    ui.mouse_y = gfx.mouse_y
+    ui.mouse_down = (gfx.mouse_cap & 1) == 1
+    ui.mouse_clicked = ui.mouse_down and not ui.prev_mouse_down
+
+    local wheel = gfx.mouse_wheel or 0
+    local wheel_delta = wheel - (ui.last_wheel or 0)
+    ui.last_wheel = wheel
+    if wheel_delta > 0 then
+      ui.wheel_steps = math.max(1, math.floor((wheel_delta / 120) + 0.5))
+    elseif wheel_delta < 0 then
+      ui.wheel_steps = math.min(-1, math.ceil((wheel_delta / 120) - 0.5))
+    else
+      ui.wheel_steps = 0
+    end
+
+    if char == string.byte("a") or char == string.byte("A") then
+      local analyzed, analyzed_message = refresh_analysis_state(ui, settings)
+      ui.status_message = analyzed and analyzed_message or ("Error: " .. tostring(analyzed_message))
+    elseif char == string.byte("d") or char == string.byte("D") then
+      local preview_ok, preview_message = run_preview(ui, settings)
+      ui.status_message = preview_ok and preview_message or ("Error: " .. tostring(preview_message))
+    elseif char == string.byte("n") or char == string.byte("N") then
+      local normalize_ok, normalize_message = run_normalize(ui, settings)
+      ui.status_message = normalize_ok and normalize_message or ("Error: " .. tostring(normalize_message))
+    elseif char == string.byte("e") or char == string.byte("E") then
+      local export_ok, export_message = handle_export_report_action(ui, settings)
+      ui.status_message = export_ok and export_message or ("Error: " .. tostring(export_message))
+    end
+
+    local should_close = draw_dashboard(ui, settings)
+
+    ui.prev_mouse_down = ui.mouse_down
+    gfx.update()
+
+    if should_close then
+      gfx.quit()
+      return
+    end
+
+    reaper.defer(loop)
+  end
+
+  loop()
+end
+
+local function main()
+  if reaper.CountSelectedMediaItems(0) == 0 then
     reaper.ShowMessageBox("Select one or more audio items before running the normalizer.", SCRIPT_TITLE, 0)
     return
   end
@@ -1790,30 +2973,13 @@ local function main()
   end
 
   save_settings(settings)
-  reaper.ClearConsole()
-
-  local ok, result_or_error = pcall(function()
-    local analyses = analyze_selected_items(selected_items, settings)
-    local plans, groups, category_names = build_normalize_plans(analyses, settings)
-
-    print_settings_summary(settings, analyses, category_names)
-    print_category_dashboard(groups, category_names, settings)
-    print_detailed_item_list(analyses)
-    print_before_after_preview(groups, category_names, settings)
-
-    local processed_ok, runtime_summary_or_error = process_plans(plans, selected_items, settings)
-    if not processed_ok then
-      error(runtime_summary_or_error)
-    end
-
-    print_action_summary(analyses, runtime_summary_or_error, settings)
+  local ok, err = pcall(function()
+    run_gfx_dashboard(settings)
   end)
 
   if not ok then
-    select_only_items(selected_items)
-    reaper.UpdateArrange()
-    log_line("[Loudness Normalizer] ERROR: " .. tostring(result_or_error))
-    reaper.ShowMessageBox("Loudness normalization failed:\n\n" .. tostring(result_or_error), SCRIPT_TITLE, 0)
+    log_line("[Loudness Normalizer] ERROR: " .. tostring(err))
+    reaper.ShowMessageBox("Loudness normalizer failed:\n\n" .. tostring(err), SCRIPT_TITLE, 0)
   end
 end
 

@@ -31,6 +31,7 @@ local DEFAULTS = {
   project_profile_name = "",
   middleware = "",
   skip_tagged = true,
+  overwrite_existing = false,
   include_bext = true,
   include_ixml = true,
   include_info = true,
@@ -219,6 +220,7 @@ local function copy_project_profile(profile)
   return result
 end
 
+
 local function encode_state_value(value)
   local encoded = tostring(value or "")
   encoded = encoded:gsub("%%", "%%25")
@@ -290,6 +292,67 @@ local function deserialize_string_list(serialized)
     items[#items + 1] = decode_state_value(line)
   end
   return items
+end
+
+local function clone_keyword_dictionary(dictionary)
+  local copy = {}
+  for key, keywords in pairs(dictionary or {}) do
+    copy[key] = {}
+    for index, keyword in ipairs(keywords or {}) do
+      copy[key][index] = tostring(keyword or "")
+    end
+  end
+  return copy
+end
+
+local function split_keywords_csv(value)
+  local keywords = {}
+  local seen = {}
+  for token in tostring(value or ""):gmatch("[^,]+") do
+    local keyword = trim_string(token):lower()
+    if keyword ~= "" and not seen[keyword] then
+      seen[keyword] = true
+      keywords[#keywords + 1] = keyword
+    end
+  end
+  return keywords
+end
+
+local function join_keywords_csv(keywords)
+  return table.concat(keywords or {}, ", ")
+end
+
+local function load_keyword_dictionary()
+  local raw = reaper.GetExtState(EXT_SECTION, "keyword_dictionary")
+  if raw == "" then
+    return clone_keyword_dictionary(KEYWORD_DICTIONARY)
+  end
+
+  local decoded = deserialize_string_map(raw)
+  local dictionary = {}
+  for key, value in pairs(decoded) do
+    dictionary[key] = split_keywords_csv(value)
+  end
+  return dictionary
+end
+
+local function save_keyword_dictionary(dictionary)
+  local serialized = {}
+  for key, keywords in pairs(dictionary or {}) do
+    serialized[key] = join_keywords_csv(keywords)
+  end
+  reaper.SetExtState(EXT_SECTION, "keyword_dictionary", serialize_string_map(serialized), true)
+end
+
+local function get_sorted_keyword_keys(dictionary)
+  local keys = {}
+  for key in pairs(dictionary or {}) do
+    keys[#keys + 1] = key
+  end
+  table.sort(keys, function(left, right)
+    return left:lower() < right:lower()
+  end)
+  return keys
 end
 
 local function serialize_custom_fields(fields)
@@ -555,6 +618,7 @@ local function prompt_for_settings(current)
     "Game Project",
     "Middleware (Wwise/FMOD/Other)",
     "Skip Already Tagged (yes/no)",
+    "Overwrite Existing Metadata (yes/no)",
     "Include bext (yes/no)",
     "Include iXML (yes/no)",
     "Include LIST-INFO (yes/no)",
@@ -569,17 +633,18 @@ local function prompt_for_settings(current)
     current.game_project,
     current.middleware,
     bool_to_string(current.skip_tagged),
+    bool_to_string(current.overwrite_existing),
     bool_to_string(current.include_bext),
     bool_to_string(current.include_ixml),
     bool_to_string(current.include_info),
   }, "|")
 
-  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE, 11, captions, defaults)
+  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE, 12, captions, defaults)
   if not ok then
     return nil, "User cancelled."
   end
 
-  local parts = split_delimited(values, "|", 11)
+  local parts = split_delimited(values, "|", 12)
   local settings = {}
   settings.mode = parse_mode(parts[1], current.mode)
   settings.source_folder = trim_string(parts[2])
@@ -589,9 +654,14 @@ local function prompt_for_settings(current)
   settings.game_project = clean_text(parts[6])
   settings.middleware = clean_text(parts[7])
   settings.skip_tagged = parse_boolean(parts[8], current.skip_tagged)
-  settings.include_bext = parse_boolean(parts[9], current.include_bext)
-  settings.include_ixml = parse_boolean(parts[10], current.include_ixml)
-  settings.include_info = parse_boolean(parts[11], current.include_info)
+  settings.overwrite_existing = parse_boolean(parts[9], current.overwrite_existing)
+  settings.include_bext = parse_boolean(parts[10], current.include_bext)
+  settings.include_ixml = parse_boolean(parts[11], current.include_ixml)
+  settings.include_info = parse_boolean(parts[12], current.include_info)
+
+  if settings.overwrite_existing then
+    settings.skip_tagged = false
+  end
 
   if settings.mode == nil then
     return nil, "Mode must be tag, verify, or read."
@@ -740,7 +810,7 @@ local function add_keyword(keywords, seen, value)
   keywords[#keywords + 1] = cleaned
 end
 
-local function generate_keywords(meta)
+local function generate_keywords(meta, keyword_dictionary)
   local keywords = {}
   local seen = {}
   local category_key = ""
@@ -749,7 +819,8 @@ local function generate_keywords(meta)
     category_key = meta.prefix .. "_" .. meta.category
   end
 
-  local dict_keywords = KEYWORD_DICTIONARY[category_key]
+  local dictionary = keyword_dictionary or KEYWORD_DICTIONARY
+  local dict_keywords = dictionary[category_key]
   if dict_keywords then
     for _, keyword in ipairs(dict_keywords) do
       add_keyword(keywords, seen, keyword)
@@ -888,6 +959,7 @@ local function extract_metadata_from_project(rendered_files, settings)
   local project_name = get_project_name()
   local regions = collect_regions()
   local region_lookup = build_region_lookup(regions)
+  local keyword_dictionary = settings.keyword_dictionary or load_keyword_dictionary()
 
   for _, file_info in ipairs(rendered_files) do
     local prefix, category, asset_name, variation = parse_filename(file_info.name)
@@ -920,14 +992,14 @@ local function extract_metadata_from_project(rendered_files, settings)
     }
 
     meta.description = build_asset_description(meta)
-    meta.keywords = generate_keywords(meta)
+    meta.keywords = generate_keywords(meta, keyword_dictionary)
     meta.unique_id = generate_unique_id(meta)
 
     if not is_blank(settings.description_template) then
       meta.description = expand_template_string(settings.description_template, meta)
     end
 
-    meta.keywords = generate_keywords(meta)
+    meta.keywords = generate_keywords(meta, keyword_dictionary)
     meta.bext_description = build_bext_description(meta)
     meta.custom_fields = build_custom_field_payload(settings.custom_fields, meta)
     meta.copyright = expand_template_string(settings.copyright_template, meta)
@@ -1406,13 +1478,13 @@ local function write_metadata_to_wav(filepath, metadata, settings)
   metadata.bit_depth = fmt.bit_depth
 
   local replacements = {}
-  if settings.include_bext then
+  if settings.include_bext and (settings.overwrite_existing or not parsed.bext) then
     replacements.bext = build_bext_chunk(metadata)
   end
-  if settings.include_ixml then
+  if settings.include_ixml and (settings.overwrite_existing or not parsed.ixml) then
     replacements.ixml = build_ixml_chunk(metadata)
   end
-  if settings.include_info then
+  if settings.include_info and (settings.overwrite_existing or not parsed.info) then
     replacements.info = build_list_info_chunk(metadata)
   end
 
@@ -1458,7 +1530,7 @@ local function batch_tag_files(metadata_list, settings)
       log_line(string.format("[Tagger] %d / %d (%.0f%%)", index, total, (index / math.max(total, 1)) * 100))
     end
 
-    if settings.skip_tagged then
+    if settings.skip_tagged and not settings.overwrite_existing then
       local existing = read_existing_metadata(meta.filepath)
       if existing and requested_chunks_present(existing, settings) then
         skip_count = skip_count + 1
@@ -1728,11 +1800,13 @@ local function build_runtime_settings_from_ui(ui)
     project_profile_name = ui.project_profile_name,
     middleware = ui.middleware ~= "" and ui.middleware or ui.default_middleware,
     description_template = ui.description_template,
-    skip_tagged = ui.skip_tagged,
+    skip_tagged = ui.skip_tagged and not ui.overwrite_existing,
+    overwrite_existing = ui.overwrite_existing,
     include_bext = ui.include_bext,
     include_ixml = ui.include_ixml,
     include_info = ui.include_info,
     custom_fields = clone_custom_fields(ui.custom_fields),
+    keyword_dictionary = clone_keyword_dictionary(ui.keyword_dictionary),
   }
 end
 
@@ -1844,6 +1918,86 @@ local function delete_project_profile_from_ui(ui)
   refresh_project_profile_names(ui)
   persist_ui_session(ui)
   set_status(ui, "Deleted project profile: " .. name)
+end
+
+local function refresh_keyword_dictionary_names(ui)
+  ui.keyword_category_names = get_sorted_keyword_keys(ui.keyword_dictionary)
+end
+
+local function sync_keyword_editor(ui)
+  local key = trim_string(ui.keyword_category_key)
+  if key ~= "" and ui.keyword_dictionary[key] then
+    ui.keyword_values_input = join_keywords_csv(ui.keyword_dictionary[key])
+  end
+end
+
+local function show_keyword_category_menu(ui, rect_x, rect_y)
+  refresh_keyword_dictionary_names(ui)
+  local items = {}
+  for _, key in ipairs(ui.keyword_category_names or {}) do
+    items[#items + 1] = (key == ui.keyword_category_key and "!" or "") .. key
+  end
+
+  if #items == 0 then
+    set_status(ui, "No keyword categories saved yet.")
+    return
+  end
+
+  gfx.x = rect_x
+  gfx.y = rect_y
+  local selection = gfx.showmenu(table.concat(items, "|"))
+  if selection > 0 and ui.keyword_category_names[selection] then
+    ui.keyword_category_key = ui.keyword_category_names[selection]
+    sync_keyword_editor(ui)
+    set_status(ui, "Keyword category: " .. ui.keyword_category_key)
+  end
+end
+
+local function save_keyword_entry_from_ui(ui)
+  local key = trim_string(ui.keyword_category_key)
+  if key == "" then
+    set_status(ui, "Keyword category key is required.")
+    return
+  end
+
+  ui.keyword_category_key = key
+  ui.keyword_dictionary[key] = split_keywords_csv(ui.keyword_values_input)
+  ui.keyword_values_input = join_keywords_csv(ui.keyword_dictionary[key])
+  refresh_keyword_dictionary_names(ui)
+  save_keyword_dictionary(ui.keyword_dictionary)
+  persist_ui_session(ui)
+  set_status(ui, "Saved keyword category: " .. key)
+end
+
+local function delete_keyword_entry_from_ui(ui)
+  local key = trim_string(ui.keyword_category_key)
+  if key == "" or not ui.keyword_dictionary[key] then
+    set_status(ui, "Select a keyword category first.")
+    return
+  end
+
+  ui.keyword_dictionary[key] = nil
+  refresh_keyword_dictionary_names(ui)
+  ui.keyword_category_key = ui.keyword_category_names[1] or ""
+  sync_keyword_editor(ui)
+  save_keyword_dictionary(ui.keyword_dictionary)
+  persist_ui_session(ui)
+  set_status(ui, "Deleted keyword category: " .. key)
+end
+
+local function reset_keyword_dictionary_from_ui(ui)
+  local confirm = reaper.ShowMessageBox("Reset the keyword dictionary to built-in defaults?", SCRIPT_TITLE, 4)
+  if confirm ~= 6 then
+    return
+  end
+
+  ui.keyword_dictionary = clone_keyword_dictionary(KEYWORD_DICTIONARY)
+  refresh_keyword_dictionary_names(ui)
+  ui.keyword_category_key = ui.keyword_category_names[1] or ""
+  sync_keyword_editor(ui)
+  save_keyword_dictionary(ui.keyword_dictionary)
+  persist_ui_session(ui)
+  set_status(ui, "Keyword dictionary reset to defaults.")
 end
 
 local function sync_custom_field_editor(ui)
@@ -2019,6 +2173,8 @@ end
 local function init_ui_state(current_settings)
   local studio_profile = load_studio_profile()
   local project_names = load_project_profile_names()
+  local keyword_dictionary = load_keyword_dictionary()
+  local keyword_keys = get_sorted_keyword_keys(keyword_dictionary)
   local selected_project_name = trim_string(current_settings.project_profile_name)
   local project_name_guess = get_project_name()
 
@@ -2035,7 +2191,7 @@ local function init_ui_state(current_settings)
 
   local ui = {
     width = 1180,
-    height = 860,
+    height = 900,
     mouse_x = 0,
     mouse_y = 0,
     mouse_down = false,
@@ -2051,6 +2207,7 @@ local function init_ui_state(current_settings)
     source_folder = current_settings.source_folder or "",
     recursive_scan = current_settings.recursive_scan,
     skip_tagged = current_settings.skip_tagged,
+    overwrite_existing = current_settings.overwrite_existing,
     include_bext = current_settings.include_bext,
     include_ixml = current_settings.include_ixml,
     include_info = current_settings.include_info,
@@ -2071,6 +2228,10 @@ local function init_ui_state(current_settings)
     custom_field_offset = 0,
     custom_key_input = "",
     custom_value_input = "",
+    keyword_dictionary = keyword_dictionary,
+    keyword_category_names = keyword_keys,
+    keyword_category_key = keyword_keys[1] or "",
+    keyword_values_input = keyword_keys[1] and join_keywords_csv(keyword_dictionary[keyword_keys[1]]) or "",
     file_count = 0,
     last_scanned_folder = "",
   }
@@ -2136,6 +2297,30 @@ local function show_project_profile_menu(ui, rect_x, rect_y)
   local selection = gfx.showmenu(table.concat(items, "|"))
   if selection > 1 and mapping[selection] ~= nil then
     select_project_profile(ui, mapping[selection])
+  end
+end
+
+local function draw_keyword_dictionary_panel(ui, rect_x, rect_y, rect_w, rect_h)
+  draw_rect(rect_x, rect_y, rect_w, rect_h, true, 22, 22, 22, 255)
+  draw_rect(rect_x, rect_y, rect_w, rect_h, false, 58, 58, 58, 255)
+  draw_section_title("Keyword Dictionary", rect_x + 14, rect_y + 12)
+
+  if draw_button(ui, "keyword_menu", ui.keyword_category_key ~= "" and ui.keyword_category_key or "Select Category", rect_x + 12, rect_y + 40, 210, 30, true) then
+    show_keyword_category_menu(ui, rect_x + 12, rect_y + 70)
+  end
+  draw_text(string.format("%d categories", #(ui.keyword_category_names or {})), rect_x + 232, rect_y + 47, 170, 190, 205, 255, 1, "Segoe UI", 12)
+
+  ui.keyword_category_key = draw_text_input(ui, "keyword_category_key", "Category Key", rect_x + 12, rect_y + 92, 180, 30, ui.keyword_category_key)
+  ui.keyword_values_input = draw_text_input(ui, "keyword_values_input", "Keywords (comma separated)", rect_x + 204, rect_y + 92, rect_w - 216, 30, ui.keyword_values_input)
+
+  if draw_button(ui, "keyword_save", "Save Entry", rect_x + 12, rect_y + 138, 90, 30, true) then
+    save_keyword_entry_from_ui(ui)
+  end
+  if draw_button(ui, "keyword_delete", "Delete", rect_x + 112, rect_y + 138, 80, 30, ui.keyword_category_key ~= "") then
+    delete_keyword_entry_from_ui(ui)
+  end
+  if draw_button(ui, "keyword_reset", "Reset Defaults", rect_x + 202, rect_y + 138, 110, 30, true) then
+    reset_keyword_dictionary_from_ui(ui)
   end
 end
 
@@ -2242,12 +2427,12 @@ local function run_gfx_ui(current_settings)
 
     draw_rect(0, 0, ui.width, ui.height, true, 16, 18, 22, 255)
     draw_text(SCRIPT_TITLE, 24, 18, 245, 245, 245, 255, 1, "Segoe UI Semibold", 22)
-    draw_text("Phase 2: gfx GUI, studio/project profiles, custom iXML fields", 24, 48, 150, 170, 185, 255, 1, "Segoe UI", 13)
+    draw_text("Phase 3: overwrite control, keyword dictionary editor, advanced profiles", 24, 48, 150, 170, 185, 255, 1, "Segoe UI", 13)
 
-    draw_rect(20, 82, 540, 720, true, 24, 24, 24, 255)
-    draw_rect(20, 82, 540, 720, false, 58, 58, 58, 255)
-    draw_rect(580, 82, 580, 720, true, 24, 24, 24, 255)
-    draw_rect(580, 82, 580, 720, false, 58, 58, 58, 255)
+    draw_rect(20, 82, 540, 760, true, 24, 24, 24, 255)
+    draw_rect(20, 82, 540, 760, false, 58, 58, 58, 255)
+    draw_rect(580, 82, 580, 760, true, 24, 24, 24, 255)
+    draw_rect(580, 82, 580, 760, false, 58, 58, 58, 255)
 
     draw_section_title("Mode / Source", 40, 104)
     local mode_labels = { tag = "Tag Files", verify = "Verify", read = "Read Metadata" }
@@ -2278,6 +2463,8 @@ local function run_gfx_ui(current_settings)
     if draw_button(ui, "save_studio", "Save Studio Profile", 40, 608, 150, 32, true) then
       save_studio_profile_from_ui(ui)
     end
+
+    draw_keyword_dictionary_panel(ui, 40, 658, 500, 160)
 
     draw_section_title("Project Profile", 600, 104)
     if draw_button(ui, "project_profile_menu", ui.project_profile_name ~= "" and ui.project_profile_name or "Unsaved / Current", 600, 132, 230, 32, true) then
@@ -2313,7 +2500,10 @@ local function run_gfx_ui(current_settings)
     ui.include_ixml = draw_checkbox(ui, "include_ixml", "Include iXML", 600, 406, ui.include_ixml)
     ui.include_info = draw_checkbox(ui, "include_info", "Include LIST-INFO", 600, 434, ui.include_info)
     ui.skip_tagged = draw_checkbox(ui, "skip_tagged", "Skip already-tagged files", 600, 462, ui.skip_tagged)
-
+    ui.overwrite_existing = draw_checkbox(ui, "overwrite_existing", "Overwrite existing metadata", 600, 490, ui.overwrite_existing)
+    if ui.overwrite_existing then
+      ui.skip_tagged = false
+    end
     draw_custom_fields_panel(ui, 600, 514, 540, 250)
 
     if draw_button(ui, "preview", "Preview Tags", 600, 778, 110, 34, true) then
@@ -2337,8 +2527,8 @@ local function run_gfx_ui(current_settings)
       return
     end
 
-    draw_rect(20, 818, 1140, 1, true, 48, 48, 48, 255)
-    draw_text(truncate_text(ui.status_message, 150), 24, 828, 170, 205, 220, 255, 1, "Segoe UI", 13)
+    draw_rect(20, 858, 1140, 1, true, 48, 48, 48, 255)
+    draw_text(truncate_text(ui.status_message, 150), 24, 868, 170, 205, 220, 255, 1, "Segoe UI", 13)
 
     if ui.mouse_released then
       ui.active_mouse_id = nil
@@ -2403,6 +2593,7 @@ local function main()
   settings.copyright_template = studio_profile.copyright_template
   settings.description_template = project_profile.description_template
   settings.custom_fields = clone_custom_fields(project_profile.custom_fields)
+  settings.keyword_dictionary = load_keyword_dictionary()
   settings.project_profile_name = current_settings.project_profile_name
 
   save_settings(settings)

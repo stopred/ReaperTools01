@@ -13,6 +13,24 @@
 local SCRIPT_TITLE = "Game Sound Asset Batch Renderer v1.0"
 local EXT_SECTION = "GameSoundBatchRenderer"
 
+local SETTINGS_KEYS = {
+  "prefix",
+  "category",
+  "case_style",
+  "naming_source",
+  "render_scope",
+  "sample_rate",
+  "bit_depth",
+  "channels",
+  "output_path",
+  "create_subfolders",
+  "tail_ms",
+  "trim_silence",
+  "trim_threshold_db",
+  "fade_out_ms",
+  "open_folder",
+}
+
 local DEFAULTS = {
   prefix = "SFX",
   category = "General",
@@ -51,6 +69,49 @@ local HUMAN_RENDER_SCOPE = {
 local HUMAN_CHANNELS = {
   [1] = "Mono",
   [2] = "Stereo",
+}
+
+local PREFIX_OPTIONS = {
+  "SFX",
+  "AMB",
+  "MUS",
+  "UI",
+  "VO",
+  "FOL",
+}
+
+local CASE_STYLE_OPTIONS = {
+  { value = "pascal", label = "PascalCase" },
+  { value = "snake", label = "snake_case" },
+}
+
+local NAMING_SOURCE_OPTIONS = {
+  { value = "regions", label = "Regions" },
+  { value = "track", label = "Track Names" },
+}
+
+local RENDER_SCOPE_OPTIONS = {
+  { value = "selected_regions", label = "Selected Regions" },
+  { value = "all_regions", label = "All Regions" },
+  { value = "selected_items", label = "Selected Items" },
+  { value = "time_selection", label = "Time Selection" },
+}
+
+local SAMPLE_RATE_OPTIONS = {
+  { value = 44100, label = "44100 Hz" },
+  { value = 48000, label = "48000 Hz" },
+  { value = 96000, label = "96000 Hz" },
+}
+
+local BIT_DEPTH_OPTIONS = {
+  { value = 16, label = "16-bit PCM" },
+  { value = 24, label = "24-bit PCM" },
+  { value = 32, label = "32-bit float" },
+}
+
+local CHANNEL_OPTIONS = {
+  { value = 1, label = "Mono" },
+  { value = 2, label = "Stereo" },
 }
 
 local NUMERIC_RENDER_KEYS = {
@@ -270,7 +331,8 @@ end
 -- Load persisted settings from ExtState.
 local function load_settings()
   local settings = {}
-  for key, default_value in pairs(DEFAULTS) do
+  for _, key in ipairs(SETTINGS_KEYS) do
+    local default_value = DEFAULTS[key]
     local stored = reaper.GetExtState(EXT_SECTION, key)
     if stored == "" then
       settings[key] = default_value
@@ -287,13 +349,213 @@ end
 
 -- Persist the latest settings into ExtState.
 local function save_settings(settings)
-  for key, value in pairs(settings) do
+  for _, key in ipairs(SETTINGS_KEYS) do
+    local value = settings[key]
     local encoded = value
     if type(value) == "boolean" then
       encoded = bool_to_string(value)
     end
     reaper.SetExtState(EXT_SECTION, key, tostring(encoded), true)
   end
+end
+
+-- Copy default values back into a settings table.
+local function reset_settings_to_defaults(settings)
+  for _, key in ipairs(SETTINGS_KEYS) do
+    settings[key] = DEFAULTS[key]
+  end
+end
+
+-- Escape text for preset storage inside ExtState.
+local function preset_escape(value)
+  local escaped = tostring(value or "")
+  escaped = escaped:gsub("%%", "%%25")
+  escaped = escaped:gsub("\r", "%%0D")
+  escaped = escaped:gsub("\n", "%%0A")
+  escaped = escaped:gsub("=", "%%3D")
+  return escaped
+end
+
+-- Unescape preset text loaded from ExtState.
+local function preset_unescape(value)
+  local unescaped = tostring(value or "")
+  unescaped = unescaped:gsub("%%3D", "=")
+  unescaped = unescaped:gsub("%%0A", "\n")
+  unescaped = unescaped:gsub("%%0D", "\r")
+  unescaped = unescaped:gsub("%%25", "%%")
+  return unescaped
+end
+
+-- Build a stable ExtState key for a preset name.
+local function preset_storage_key(name)
+  local hex_parts = {}
+  for index = 1, #name do
+    hex_parts[#hex_parts + 1] = string.format("%02X", name:byte(index))
+  end
+  return "preset_" .. table.concat(hex_parts)
+end
+
+-- Sanitize a user preset name.
+local function normalize_preset_name(name)
+  local value = trim_string(name)
+  value = value:gsub("[%c]", " ")
+  value = value:gsub("%s+", " ")
+  return value
+end
+
+-- Read all saved preset names from ExtState.
+local function load_preset_names()
+  local stored = reaper.GetExtState(EXT_SECTION, "preset_names")
+  local names = {}
+
+  for line in tostring(stored or ""):gmatch("[^\n]+") do
+    local name = normalize_preset_name(preset_unescape(line))
+    if name ~= "" then
+      names[#names + 1] = name
+    end
+  end
+
+  table.sort(names, function(left, right)
+    return left:lower() < right:lower()
+  end)
+
+  return names
+end
+
+-- Persist the current preset name list to ExtState.
+local function save_preset_names(names)
+  local lines = {}
+  for _, name in ipairs(names) do
+    lines[#lines + 1] = preset_escape(name)
+  end
+  reaper.SetExtState(EXT_SECTION, "preset_names", table.concat(lines, "\n"), true)
+end
+
+-- Save the last-used preset name separately for GUI display.
+local function set_last_preset_name(name)
+  reaper.SetExtState(EXT_SECTION, "last_preset_name", tostring(name or ""), true)
+end
+
+-- Return the last-used preset name if it still exists.
+local function get_last_preset_name()
+  local name = normalize_preset_name(reaper.GetExtState(EXT_SECTION, "last_preset_name"))
+  if name == "" then
+    return ""
+  end
+
+  for _, preset_name in ipairs(load_preset_names()) do
+    if preset_name == name then
+      return name
+    end
+  end
+
+  return ""
+end
+
+-- Serialize the current settings into a preset blob.
+local function serialize_preset(settings)
+  local lines = {}
+  for _, key in ipairs(SETTINGS_KEYS) do
+    lines[#lines + 1] = key .. "=" .. preset_escape(settings[key])
+  end
+  return table.concat(lines, "\n")
+end
+
+-- Apply a serialized preset blob onto the current settings table.
+local function apply_serialized_preset(settings, blob)
+  local applied = false
+
+  for line in tostring(blob or ""):gmatch("[^\n]+") do
+    local key, value = line:match("^([^=]+)=(.*)$")
+    if key and DEFAULTS[key] ~= nil then
+      local default_value = DEFAULTS[key]
+      local decoded = preset_unescape(value)
+      if type(default_value) == "boolean" then
+        settings[key] = parse_boolean(decoded, default_value)
+      elseif type(default_value) == "number" then
+        settings[key] = tonumber(decoded) or default_value
+      else
+        settings[key] = decoded
+      end
+      applied = true
+    end
+  end
+
+  return applied
+end
+
+-- Save the current settings as a named preset.
+local function save_named_preset(name, settings)
+  local preset_name = normalize_preset_name(name)
+  if preset_name == "" then
+    return false
+  end
+
+  reaper.SetExtState(EXT_SECTION, preset_storage_key(preset_name), serialize_preset(settings), true)
+
+  local names = load_preset_names()
+  local exists = false
+  for _, existing_name in ipairs(names) do
+    if existing_name == preset_name then
+      exists = true
+      break
+    end
+  end
+
+  if not exists then
+    names[#names + 1] = preset_name
+    table.sort(names, function(left, right)
+      return left:lower() < right:lower()
+    end)
+    save_preset_names(names)
+  end
+
+  set_last_preset_name(preset_name)
+  return true
+end
+
+-- Load a named preset onto the active settings table.
+local function load_named_preset(name, settings)
+  local preset_name = normalize_preset_name(name)
+  if preset_name == "" then
+    return false
+  end
+
+  local blob = reaper.GetExtState(EXT_SECTION, preset_storage_key(preset_name))
+  if blob == "" then
+    return false
+  end
+
+  local applied = apply_serialized_preset(settings, blob)
+  if applied then
+    save_settings(settings)
+    set_last_preset_name(preset_name)
+  end
+  return applied
+end
+
+-- Delete a named preset from ExtState.
+local function delete_named_preset(name)
+  local preset_name = normalize_preset_name(name)
+  if preset_name == "" then
+    return false
+  end
+
+  reaper.DeleteExtState(EXT_SECTION, preset_storage_key(preset_name), true)
+
+  local names = {}
+  for _, existing_name in ipairs(load_preset_names()) do
+    if existing_name ~= preset_name then
+      names[#names + 1] = existing_name
+    end
+  end
+  save_preset_names(names)
+
+  if get_last_preset_name() == preset_name then
+    set_last_preset_name("")
+  end
+
+  return true
 end
 
 -- Convert user text to the supported case style key.
@@ -504,6 +766,125 @@ local function prompt_output_settings(settings)
   settings.open_folder = parse_boolean(values[7], settings.open_folder)
   return true
 end
+
+-- Prompt for a single text value and return nil when canceled.
+local function prompt_single_text(title, caption, default_value)
+  local ok, value = reaper.GetUserInputs(title, 1, caption, tostring(default_value or ""))
+  if not ok then
+    return nil
+  end
+  return trim_string(value)
+end
+
+-- Prompt for a number and fall back to nil when canceled or invalid.
+local function prompt_single_number(title, caption, default_value)
+  local result = prompt_single_text(title, caption, tostring(default_value or ""))
+  if result == nil then
+    return nil
+  end
+  local numeric = tonumber(result)
+  if numeric == nil then
+    reaper.ShowMessageBox("Please enter a valid number.", SCRIPT_TITLE, 0)
+    return nil
+  end
+  return numeric
+end
+
+-- Return the label for the current bit depth.
+local function get_bit_depth_label(bit_depth)
+  for _, option in ipairs(BIT_DEPTH_OPTIONS) do
+    if option.value == bit_depth then
+      return option.label
+    end
+  end
+  return tostring(bit_depth)
+end
+
+-- Return the label for the current sample rate.
+local function get_sample_rate_label(sample_rate)
+  for _, option in ipairs(SAMPLE_RATE_OPTIONS) do
+    if option.value == sample_rate then
+      return option.label
+    end
+  end
+  return tostring(sample_rate)
+end
+
+-- Return the label for the current render scope.
+local function get_render_scope_label(render_scope)
+  return HUMAN_RENDER_SCOPE[render_scope] or render_scope
+end
+
+-- Return the label for the current naming source.
+local function get_naming_source_label(naming_source)
+  return HUMAN_NAMING_SOURCE[naming_source] or naming_source
+end
+
+-- Return the label for the current case style.
+local function get_case_style_label(case_style)
+  return HUMAN_CASE_STYLE[case_style] or case_style
+end
+
+-- Find the matching option index in an option table.
+local function find_option_index(options, current_value)
+  for index, option in ipairs(options) do
+    local option_value = type(option) == "table" and option.value or option
+    if option_value == current_value then
+      return index
+    end
+  end
+  return 1
+end
+
+-- Show a popup menu at the given position and return the selected option value.
+local function show_option_menu(x, y, options, current_value)
+  local menu_parts = {}
+  local current_index = find_option_index(options, current_value)
+
+  for index, option in ipairs(options) do
+    local label = type(option) == "table" and option.label or tostring(option)
+    if index == current_index then
+      label = "!" .. label
+    end
+    menu_parts[#menu_parts + 1] = label
+  end
+
+  gfx.x = x
+  gfx.y = y
+  local selected_index = gfx.showmenu(table.concat(menu_parts, "|"))
+  if selected_index <= 0 then
+    return nil
+  end
+
+  local selected_option = options[selected_index]
+  if type(selected_option) == "table" then
+    return selected_option.value
+  end
+  return selected_option
+end
+
+-- Try to browse for a folder via JS extension, otherwise fall back to a text prompt.
+local function browse_for_output_path(current_path)
+  local start_path = current_path
+  if is_blank(start_path) then
+    start_path = get_default_output_root()
+  end
+
+  if reaper.JS_Dialog_BrowseForFolder then
+    local selected = reaper.JS_Dialog_BrowseForFolder(SCRIPT_TITLE, start_path)
+    if selected and selected ~= "" then
+      return normalize_path(selected)
+    end
+    return nil
+  end
+
+  local typed = prompt_single_text(SCRIPT_TITLE .. " - Output Path", "Output Path", start_path)
+  if typed == nil then
+    return nil
+  end
+  return normalize_path(typed)
+end
+
 
 -- Validate the essential settings before collecting jobs.
 local function validate_settings(settings)
@@ -1161,26 +1542,12 @@ local function open_output_folder(path)
   os.execute('explorer "' .. normalized .. '"')
 end
 
--- Execute the full prompt -> preview -> render flow.
-local function main()
-  local settings = load_settings()
-
-  if not prompt_naming_settings(settings) then
-    return
-  end
-
-  if not prompt_render_settings(settings) then
-    return
-  end
-
-  if not prompt_output_settings(settings) then
-    return
-  end
-
+-- Validate and build the current batch jobs for preview or render.
+local function prepare_jobs(settings)
   local valid, validation_error = validate_settings(settings)
   if not valid then
     reaper.ShowMessageBox(validation_error, SCRIPT_TITLE, 0)
-    return
+    return nil, validation_error
   end
 
   save_settings(settings)
@@ -1188,21 +1555,44 @@ local function main()
   local jobs, build_error = build_render_jobs(settings)
   if not jobs then
     reaper.ShowMessageBox(build_error, SCRIPT_TITLE, 0)
-    return
+    return nil, build_error
   end
 
   local generated_duplicates, existing_files = inspect_job_conflicts(jobs)
   if not reject_generated_duplicates(generated_duplicates) then
-    return
+    return nil, "Duplicate generated file names were detected."
+  end
+
+  return jobs, existing_files
+end
+
+-- Preview names from the current GUI settings and return a status message.
+local function preview_from_settings(settings)
+  local jobs, existing_files = prepare_jobs(settings)
+  if not jobs then
+    return false, "Preview failed."
+  end
+
+  preview_jobs(jobs)
+
+  local message = string.format("Previewed %d file names.", #jobs)
+  if #existing_files > 0 then
+    message = message .. string.format(" %d existing files were also found.", #existing_files)
+  end
+
+  reaper.ShowMessageBox("Preview printed to the ReaScript console.", SCRIPT_TITLE, 0)
+  return true, message
+end
+
+-- Render from the current GUI settings and return a status message.
+local function render_from_settings(settings)
+  local jobs, existing_files = prepare_jobs(settings)
+  if not jobs then
+    return false, "Render canceled."
   end
 
   if not confirm_existing_files(existing_files) then
-    return
-  end
-
-  local action = choose_preview_or_render(settings, jobs)
-  if action ~= "render" then
-    return
+    return false, "Render canceled."
   end
 
   reaper.ClearConsole()
@@ -1220,6 +1610,467 @@ local function main()
   else
     reaper.ShowMessageBox("Render failed:\n\n" .. tostring(result), SCRIPT_TITLE, 0)
   end
+
+  return ok, result
+end
+
+-- Set the current drawing color.
+local function gui_set_color(r, g, b, a)
+  gfx.set(r, g, b, a or 1)
+end
+
+-- Draw a text label using the requested size.
+local function gui_draw_text(x, y, text, size, r, g, b, a)
+  gfx.setfont(1, "Segoe UI", size)
+  gui_set_color(r, g, b, a)
+  gfx.x = x
+  gfx.y = y
+  gfx.drawstr(tostring(text or ""))
+end
+
+-- Return true when the mouse is inside the given rectangle.
+local function gui_point_in_rect(x, y, rect)
+  return x >= rect.x and x <= (rect.x + rect.w) and y >= rect.y and y <= (rect.y + rect.h)
+end
+
+-- Shorten text so it fits inside a button.
+local function gui_fit_text(text, max_width, font_size)
+  local value = tostring(text or "")
+  gfx.setfont(1, "Segoe UI", font_size)
+
+  if gfx.measurestr(value) <= max_width then
+    return value
+  end
+
+  local clipped = value
+  while #clipped > 0 and gfx.measurestr(clipped .. "...") > max_width do
+    clipped = clipped:sub(1, -2)
+  end
+
+  return clipped .. "..."
+end
+
+-- Register and draw a clickable button.
+local function gui_button(ui, x, y, w, h, label, on_click, options)
+  local rect = { x = x, y = y, w = w, h = h, on_click = on_click }
+  ui.buttons[#ui.buttons + 1] = rect
+
+  local hovered = gui_point_in_rect(gfx.mouse_x, gfx.mouse_y, rect)
+  local active = options and options.active
+  local fill = options and options.fill or { 0.20, 0.24, 0.30, 1 }
+  local border = options and options.border or { 0.42, 0.48, 0.58, 1 }
+  local text_color = options and options.text or { 0.95, 0.96, 0.98, 1 }
+
+  if active then
+    fill = { 0.23, 0.47, 0.36, 1 }
+    border = { 0.33, 0.69, 0.52, 1 }
+  elseif hovered then
+    fill = { math.min(fill[1] + 0.05, 1), math.min(fill[2] + 0.05, 1), math.min(fill[3] + 0.05, 1), fill[4] }
+  end
+
+  gui_set_color(fill[1], fill[2], fill[3], fill[4])
+  gfx.rect(x, y, w, h, 1)
+  gui_set_color(border[1], border[2], border[3], border[4])
+  gfx.rect(x, y, w, h, 0)
+
+  local font_size = options and options.font_size or 15
+  local text = gui_fit_text(label, w - 16, font_size)
+  gfx.setfont(1, "Segoe UI", font_size)
+  local text_w, text_h = gfx.measurestr(text)
+  gui_draw_text(x + (w - text_w) * 0.5, y + (h - text_h) * 0.5, text, font_size, text_color[1], text_color[2], text_color[3], text_color[4])
+end
+
+-- Draw a titled section box.
+local function gui_section(x, y, w, h, title)
+  gui_set_color(0.12, 0.14, 0.18, 1)
+  gfx.rect(x, y, w, h, 1)
+  gui_set_color(0.28, 0.32, 0.38, 1)
+  gfx.rect(x, y, w, h, 0)
+  gui_draw_text(x + 12, y + 10, title, 17, 0.93, 0.95, 0.98, 1)
+end
+
+-- Draw a labeled value row with a primary edit button.
+local function gui_value_row(ui, x, y, label, value, on_click, options)
+  local value_w = options and options.value_w or 320
+  gui_draw_text(x, y + 6, label, 15, 0.86, 0.88, 0.92, 1)
+  gui_button(ui, x + 150, y, value_w, 28, value, on_click, options and options.button_options or nil)
+
+  if options and options.extra_buttons then
+    local extra_x = x + 150 + value_w + 8
+    for _, button in ipairs(options.extra_buttons) do
+      gui_button(ui, extra_x, y, button.w, 28, button.label, button.on_click, button.options)
+      extra_x = extra_x + button.w + 8
+    end
+  end
+end
+
+-- Draw a labeled toggle row with multiple option buttons.
+local function gui_toggle_row(ui, x, y, label, options, current_value, on_select)
+  gui_draw_text(x, y + 6, label, 15, 0.86, 0.88, 0.92, 1)
+  local button_x = x + 150
+  for _, option in ipairs(options) do
+    gui_button(ui, button_x, y, 140, 28, option.label, function()
+      on_select(option.value)
+    end, { active = option.value == current_value })
+    button_x = button_x + 148
+  end
+end
+
+-- Dispatch mouse clicks to the topmost button under the cursor.
+local function gui_dispatch_mouse(ui)
+  local mouse_down = (gfx.mouse_cap & 1) == 1
+  if mouse_down and not ui.prev_mouse_down then
+    for index = #ui.buttons, 1, -1 do
+      local button = ui.buttons[index]
+      if gui_point_in_rect(gfx.mouse_x, gfx.mouse_y, button) then
+        button.on_click()
+        break
+      end
+    end
+  end
+  ui.prev_mouse_down = mouse_down
+end
+
+-- Open the legacy multi-dialog editor from the GUI.
+local function gui_open_dialog_editor(settings, ui)
+  if not prompt_naming_settings(settings) then
+    return
+  end
+  if not prompt_render_settings(settings) then
+    return
+  end
+  if not prompt_output_settings(settings) then
+    return
+  end
+  save_settings(settings)
+  ui.current_preset_name = ""
+  set_last_preset_name("")
+  ui.status_message = "Settings updated from dialog editor."
+end
+
+-- Draw the entire Phase 3 GUI.
+local function gui_draw(settings, ui)
+  ui.buttons = {}
+
+  gui_set_color(0.08, 0.09, 0.11, 1)
+  gfx.rect(0, 0, gfx.w, gfx.h, 1)
+
+  gui_draw_text(24, 18, SCRIPT_TITLE, 24, 0.96, 0.98, 1.0, 1)
+  gui_draw_text(24, 48, "Click a value to edit it. Menus are inline; text and numeric values open a small prompt.", 14, 0.72, 0.76, 0.82, 1)
+
+  local margin = 20
+  local section_w = gfx.w - margin * 2
+
+  gui_section(margin, 78, section_w, 82, "Presets")
+  gui_value_row(ui, margin + 18, 118, "Current Preset", ui.current_preset_name ~= "" and ui.current_preset_name or "(unsaved)", function()
+    local names = load_preset_names()
+    if #names == 0 then
+      reaper.ShowMessageBox("No presets have been saved yet.", SCRIPT_TITLE, 0)
+      return
+    end
+
+    local options = {}
+    for _, name in ipairs(names) do
+      options[#options + 1] = { value = name, label = name }
+    end
+
+    local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, options, ui.current_preset_name)
+    if selected and load_named_preset(selected, settings) then
+      ui.current_preset_name = selected
+      ui.status_message = "Preset loaded: " .. selected
+    end
+  end, {
+    value_w = 360,
+    extra_buttons = {
+      {
+        label = "Load",
+        w = 92,
+        on_click = function()
+          local names = load_preset_names()
+          if #names == 0 then
+            reaper.ShowMessageBox("No presets have been saved yet.", SCRIPT_TITLE, 0)
+            return
+          end
+
+          local options = {}
+          for _, name in ipairs(names) do
+            options[#options + 1] = { value = name, label = name }
+          end
+
+          local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, options, ui.current_preset_name)
+          if selected and load_named_preset(selected, settings) then
+            ui.current_preset_name = selected
+            ui.status_message = "Preset loaded: " .. selected
+          end
+        end,
+      },
+      {
+        label = "Save",
+        w = 92,
+        on_click = function()
+          local suggested = ui.current_preset_name
+          if suggested == "" then
+            suggested = settings.prefix .. "_" .. settings.category
+          end
+          local name = prompt_single_text(SCRIPT_TITLE .. " - Save Preset", "Preset Name", suggested)
+          if name and save_named_preset(name, settings) then
+            ui.current_preset_name = normalize_preset_name(name)
+            ui.status_message = "Preset saved: " .. ui.current_preset_name
+          end
+        end,
+      },
+      {
+        label = "Delete",
+        w = 92,
+        on_click = function()
+          local preset_name = ui.current_preset_name
+          if preset_name == "" then
+            reaper.ShowMessageBox("Select or save a preset first.", SCRIPT_TITLE, 0)
+            return
+          end
+
+          local response = reaper.ShowMessageBox("Delete preset '" .. preset_name .. "'?", SCRIPT_TITLE, 4)
+          if response == 6 and delete_named_preset(preset_name) then
+            ui.current_preset_name = ""
+            ui.status_message = "Preset deleted."
+          end
+        end,
+      },
+      {
+        label = "Defaults",
+        w = 100,
+        on_click = function()
+          reset_settings_to_defaults(settings)
+          save_settings(settings)
+          ui.current_preset_name = ""
+          set_last_preset_name("")
+          ui.status_message = "Settings reset to defaults."
+        end,
+      },
+    },
+  })
+
+  gui_section(margin, 172, section_w, 174, "Naming Convention")
+  gui_value_row(ui, margin + 18, 214, "Prefix", settings.prefix, function()
+    local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, PREFIX_OPTIONS, settings.prefix)
+    if selected then
+      settings.prefix = selected
+      save_settings(settings)
+      ui.status_message = "Prefix updated."
+    end
+  end)
+  gui_value_row(ui, margin + 18, 250, "Category", settings.category, function()
+    local value = prompt_single_text(SCRIPT_TITLE .. " - Category", "Category", settings.category)
+    if value and value ~= "" then
+      settings.category = value
+      save_settings(settings)
+      ui.status_message = "Category updated."
+    end
+  end, { value_w = 420 })
+  gui_toggle_row(ui, margin + 18, 286, "Case Style", CASE_STYLE_OPTIONS, settings.case_style, function(value)
+    settings.case_style = value
+    save_settings(settings)
+    ui.status_message = "Case style updated."
+  end)
+  gui_toggle_row(ui, margin + 18, 322, "Naming Source", NAMING_SOURCE_OPTIONS, settings.naming_source, function(value)
+    settings.naming_source = value
+    save_settings(settings)
+    ui.status_message = "Naming source updated."
+  end)
+
+  gui_section(margin, 358, section_w, 174, "Render Settings")
+  gui_value_row(ui, margin + 18, 400, "Render Scope", get_render_scope_label(settings.render_scope), function()
+    local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, RENDER_SCOPE_OPTIONS, settings.render_scope)
+    if selected then
+      settings.render_scope = selected
+      save_settings(settings)
+      ui.status_message = "Render scope updated."
+    end
+  end)
+  gui_value_row(ui, margin + 18, 436, "Sample Rate", get_sample_rate_label(settings.sample_rate), function()
+    local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, SAMPLE_RATE_OPTIONS, settings.sample_rate)
+    if selected then
+      settings.sample_rate = selected
+      save_settings(settings)
+      ui.status_message = "Sample rate updated."
+    end
+  end)
+  gui_value_row(ui, margin + 18, 472, "Bit Depth", get_bit_depth_label(settings.bit_depth), function()
+    local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, BIT_DEPTH_OPTIONS, settings.bit_depth)
+    if selected then
+      settings.bit_depth = selected
+      save_settings(settings)
+      ui.status_message = "Bit depth updated."
+    end
+  end)
+  gui_toggle_row(ui, margin + 18, 508, "Channels", CHANNEL_OPTIONS, settings.channels, function(value)
+    settings.channels = value
+    save_settings(settings)
+    ui.status_message = "Channel mode updated."
+  end)
+
+  gui_section(margin, 544, section_w, 142, "Output")
+  gui_value_row(ui, margin + 18, 586, "Output Path", get_target_output_directory(settings), function()
+    local value = prompt_single_text(SCRIPT_TITLE .. " - Output Path", "Output Path", resolve_output_root(settings))
+    if value ~= nil then
+      settings.output_path = normalize_path(value)
+      save_settings(settings)
+      ui.status_message = "Output path updated."
+    end
+  end, {
+    value_w = 500,
+    extra_buttons = {
+      {
+        label = "Browse",
+        w = 110,
+        on_click = function()
+          local selected = browse_for_output_path(resolve_output_root(settings))
+          if selected then
+            settings.output_path = selected
+            save_settings(settings)
+            ui.status_message = "Output path updated."
+          end
+        end,
+      },
+      {
+        label = "Default",
+        w = 110,
+        on_click = function()
+          settings.output_path = ""
+          save_settings(settings)
+          ui.status_message = "Output path reset to project /Renders."
+        end,
+      },
+    },
+  })
+  gui_toggle_row(ui, margin + 18, 622, "Subfolders", {
+    { value = true, label = "By Prefix" },
+    { value = false, label = "Flat Folder" },
+  }, settings.create_subfolders, function(value)
+    settings.create_subfolders = value
+    save_settings(settings)
+    ui.status_message = "Output folder mode updated."
+  end)
+
+  gui_section(margin, 698, section_w, 150, "Post-Processing")
+  gui_value_row(ui, margin + 18, 740, "Tail (ms)", tostring(settings.tail_ms), function()
+    local value = prompt_single_number(SCRIPT_TITLE .. " - Tail", "Tail (ms)", settings.tail_ms)
+    if value ~= nil then
+      settings.tail_ms = math.max(0, value)
+      save_settings(settings)
+      ui.status_message = "Tail updated."
+    end
+  end)
+  gui_toggle_row(ui, margin + 18, 776, "Trim Silence", {
+    { value = true, label = "Enabled" },
+    { value = false, label = "Disabled" },
+  }, settings.trim_silence, function(value)
+    settings.trim_silence = value
+    save_settings(settings)
+    ui.status_message = "Trim silence updated."
+  end)
+  gui_value_row(ui, margin + 18, 812, "Trim Threshold", tostring(settings.trim_threshold_db) .. " dB", function()
+    local value = prompt_single_number(SCRIPT_TITLE .. " - Trim Threshold", "Trim Threshold dB", settings.trim_threshold_db)
+    if value ~= nil then
+      settings.trim_threshold_db = value
+      save_settings(settings)
+      ui.status_message = "Trim threshold updated."
+    end
+  end, {
+    value_w = 220,
+    extra_buttons = {
+      {
+        label = "Fade Out",
+        w = 110,
+        on_click = function()
+          local value = prompt_single_number(SCRIPT_TITLE .. " - Fade Out", "Fade Out (ms)", settings.fade_out_ms)
+          if value ~= nil then
+            settings.fade_out_ms = math.max(0, value)
+            save_settings(settings)
+            ui.status_message = "Fade out updated."
+          end
+        end,
+      },
+      {
+        label = tostring(settings.fade_out_ms) .. " ms",
+        w = 110,
+        on_click = function()
+          local value = prompt_single_number(SCRIPT_TITLE .. " - Fade Out", "Fade Out (ms)", settings.fade_out_ms)
+          if value ~= nil then
+            settings.fade_out_ms = math.max(0, value)
+            save_settings(settings)
+            ui.status_message = "Fade out updated."
+          end
+        end,
+        options = { active = settings.fade_out_ms > 0 },
+      },
+      {
+        label = settings.open_folder and "Open Folder On" or "Open Folder Off",
+        w = 150,
+        on_click = function()
+          settings.open_folder = not settings.open_folder
+          save_settings(settings)
+          ui.status_message = "Open folder option updated."
+        end,
+        options = { active = settings.open_folder },
+      },
+    },
+  })
+
+  gui_set_color(0.15, 0.17, 0.21, 1)
+  gfx.rect(0, gfx.h - 74, gfx.w, 74, 1)
+  gui_draw_text(24, gfx.h - 60, gui_fit_text(ui.status_message or "Ready.", gfx.w - 420, 14), 14, 0.82, 0.86, 0.92, 1)
+
+  gui_button(ui, gfx.w - 516, gfx.h - 56, 120, 34, "Dialog Edit", function()
+    gui_open_dialog_editor(settings, ui)
+  end, { fill = { 0.22, 0.24, 0.28, 1 } })
+  gui_button(ui, gfx.w - 384, gfx.h - 56, 120, 34, "Preview Names", function()
+    local ok, message = preview_from_settings(settings)
+    ui.status_message = message
+    if ok then
+      ui.status_message = message
+    end
+  end, { fill = { 0.22, 0.31, 0.46, 1 }, border = { 0.38, 0.52, 0.76, 1 } })
+  gui_button(ui, gfx.w - 252, gfx.h - 56, 120, 34, "Render All", function()
+    local ok, message = render_from_settings(settings)
+    ui.status_message = message
+    if ok then
+      ui.close_requested = true
+    end
+  end, { fill = { 0.20, 0.45, 0.33, 1 }, border = { 0.35, 0.70, 0.54, 1 } })
+  gui_button(ui, gfx.w - 120, gfx.h - 56, 96, 34, "Cancel", function()
+    ui.close_requested = true
+  end, { fill = { 0.34, 0.19, 0.19, 1 }, border = { 0.64, 0.36, 0.36, 1 } })
+end
+
+-- Run the Phase 3 gfx interface until the user closes it.
+local function run_gui(settings)
+  local ui = {
+    buttons = {},
+    prev_mouse_down = false,
+    close_requested = false,
+    current_preset_name = get_last_preset_name(),
+    status_message = "Ready. Adjust settings, preview names, or render.",
+  }
+
+  gfx.init(SCRIPT_TITLE, 980, 960, 0)
+
+  while not ui.close_requested do
+    local key = gfx.getchar()
+    if key < 0 or key == 27 then
+      break
+    end
+
+    gui_draw(settings, ui)
+    gui_dispatch_mouse(ui)
+    gfx.update()
+  end
+end
+
+-- Launch the GUI with the last saved settings.
+local function main()
+  local settings = load_settings()
+  run_gui(settings)
 end
 
 main()

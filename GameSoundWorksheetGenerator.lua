@@ -42,6 +42,20 @@ local DEFAULT_STATUS_COLORS = {
   Approved = { r = 60,  g = 180, b = 160 },
 }
 
+local function clone_status_colors(source)
+  local copy = {}
+  for status, color in pairs(source) do
+    copy[status] = {
+      r = tonumber(color.r) or 0,
+      g = tonumber(color.g) or 0,
+      b = tonumber(color.b) or 0,
+    }
+  end
+  return copy
+end
+
+local STATUS_COLORS = clone_status_colors(DEFAULT_STATUS_COLORS)
+
 local DEFAULTS = {
   mode = "export",
   gui_mode = "export",
@@ -49,6 +63,7 @@ local DEFAULTS = {
   include_markers = false,
   only_time_selection = false,
   include_audio_analysis = false,
+  include_pivot_summary = false,
   output_format = "csv",
   export_path = "",
   add_bom = true,
@@ -190,6 +205,14 @@ local function strip_extension(path)
   return tostring(path or ""):gsub("%.[^%.\\/]+$", "")
 end
 
+local function shallow_copy(source)
+  local copy = {}
+  for key, value in pairs(source or {}) do
+    copy[key] = value
+  end
+  return copy
+end
+
 local function ensure_directory(path)
   local normalized = normalize_path(path)
   if normalized == "" then
@@ -212,6 +235,57 @@ local function open_path_with_shell(path)
 
   os.execute('start "" "' .. normalized:gsub("/", "\\") .. '"')
   return true
+end
+
+local function parse_hex_color(value)
+  local text = trim_string(value):upper():gsub("#", "")
+  if text:match("^[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]$") then
+    return {
+      r = tonumber(text:sub(1, 2), 16),
+      g = tonumber(text:sub(3, 4), 16),
+      b = tonumber(text:sub(5, 6), 16),
+    }
+  end
+  return nil
+end
+
+local function format_hex_color(color)
+  if not color then
+    return "#000000"
+  end
+  return string.format("#%02X%02X%02X", tonumber(color.r) or 0, tonumber(color.g) or 0, tonumber(color.b) or 0)
+end
+
+local function serialize_status_colors()
+  local parts = {}
+  for _, status in ipairs({ "Done", "WIP", "Review", "Revision", "Todo", "Hold", "Approved" }) do
+    local color = STATUS_COLORS[status] or DEFAULT_STATUS_COLORS[status]
+    parts[#parts + 1] = status .. "=" .. format_hex_color(color)
+  end
+  return table.concat(parts, ";")
+end
+
+local function load_status_colors()
+  STATUS_COLORS = clone_status_colors(DEFAULT_STATUS_COLORS)
+  local stored = reaper.GetExtState(EXT_SECTION, "status_colors")
+  if trim_string(stored) == "" then
+    return
+  end
+
+  for token in tostring(stored):gmatch("[^;]+") do
+    local status, color_value = token:match("^([^=]+)=(.+)$")
+    status = trim_string(status)
+    if status ~= "" and DEFAULT_STATUS_COLORS[status] then
+      local parsed = parse_hex_color(color_value or "")
+      if parsed then
+        STATUS_COLORS[status] = parsed
+      end
+    end
+  end
+end
+
+local function save_status_colors()
+  reaper.SetExtState(EXT_SECTION, "status_colors", serialize_status_colors(), true)
 end
 
 local function get_project_file_path()
@@ -258,10 +332,11 @@ end
 
 local function resolve_export_paths(settings)
   local base_path = get_export_base_path(settings.export_path)
-  return base_path .. ".csv", base_path .. ".txt"
+  return base_path .. ".csv", base_path .. ".txt", base_path .. "_pivot.csv"
 end
 
 local function load_settings()
+  load_status_colors()
   local settings = {}
   for key, default_value in pairs(DEFAULTS) do
     local stored = reaper.GetExtState(EXT_SECTION, key)
@@ -279,6 +354,7 @@ local function load_settings()
 end
 
 local function save_settings(settings)
+  save_status_colors()
   for key, value in pairs(settings) do
     local encoded = value
     if type(value) == "boolean" then
@@ -398,7 +474,7 @@ local function detect_status_from_color(native_color)
   local min_distance = math.huge
   local best_status = "Unknown"
 
-  for status, reference in pairs(DEFAULT_STATUS_COLORS) do
+  for status, reference in pairs(STATUS_COLORS) do
     local distance = math.sqrt((r - reference.r) ^ 2 + (g - reference.g) ^ 2 + (b - reference.b) ^ 2)
     if distance < min_distance then
       min_distance = distance
@@ -415,7 +491,7 @@ end
 
 local function get_color_for_status(status)
   local resolved = canonicalize_status(status) or map_priority_to_status(status)
-  local reference = DEFAULT_STATUS_COLORS[resolved]
+  local reference = STATUS_COLORS[resolved]
   if not reference then
     return 0
   end
@@ -570,9 +646,105 @@ local function range_has_audio(start_pos, end_pos)
   return false
 end
 
+local function log10(value)
+  return math.log(value) / math.log(10)
+end
+
+local function linear_to_db(linear_value)
+  local safe = math.max(math.abs(tonumber(linear_value) or 0.0), 1e-12)
+  return 20.0 * log10(safe)
+end
+
+local function create_region_analysis_context()
+  local master_track = reaper.GetMasterTrack and reaper.GetMasterTrack(0) or nil
+  if not master_track or not reaper.CreateTrackAudioAccessor or not reaper.GetAudioAccessorSamples or not reaper.new_array then
+    return nil
+  end
+
+  local accessor = reaper.CreateTrackAudioAccessor(master_track)
+  if not accessor then
+    return nil
+  end
+
+  return {
+    accessor = accessor,
+    sample_rate = 48000,
+    num_channels = 2,
+    block_size = 2048,
+  }
+end
+
+local function destroy_region_analysis_context(context)
+  if context and context.accessor and reaper.DestroyAudioAccessor then
+    reaper.DestroyAudioAccessor(context.accessor)
+  end
+end
+
+local function analyze_region_audio(context, start_pos, end_pos)
+  if not context or not context.accessor or end_pos <= start_pos then
+    return nil, nil, range_has_audio(start_pos, end_pos)
+  end
+
+  local total_frames = math.max(1, math.floor((end_pos - start_pos) * context.sample_rate + 0.5))
+  local buffer = reaper.new_array(context.block_size * context.num_channels)
+  local peak_linear = 0.0
+  local total_sum_squares = 0.0
+  local total_count = 0
+  local frame_cursor = 0
+
+  while frame_cursor < total_frames do
+    local frames_to_read = math.min(context.block_size, total_frames - frame_cursor)
+    buffer.clear()
+
+    local retval = reaper.GetAudioAccessorSamples(
+      context.accessor,
+      context.sample_rate,
+      context.num_channels,
+      start_pos + (frame_cursor / context.sample_rate),
+      frames_to_read,
+      buffer
+    )
+
+    if retval < 0 then
+      return nil, nil, range_has_audio(start_pos, end_pos)
+    end
+
+    if retval ~= 0 then
+      for frame_index = 0, frames_to_read - 1 do
+        local base_index = frame_index * context.num_channels
+        for channel = 1, context.num_channels do
+          local sample = buffer[base_index + channel]
+          local abs_sample = math.abs(sample)
+          local squared = sample * sample
+
+          if abs_sample > peak_linear then
+            peak_linear = abs_sample
+          end
+
+          total_sum_squares = total_sum_squares + squared
+          total_count = total_count + 1
+        end
+      end
+    end
+
+    frame_cursor = frame_cursor + frames_to_read
+  end
+
+  if total_count == 0 or peak_linear <= 1e-6 then
+    return nil, nil, false
+  end
+
+  local rms_linear = math.sqrt(total_sum_squares / total_count)
+  local peak_db = linear_to_db(peak_linear)
+  local rms_db = rms_linear > 1e-6 and linear_to_db(rms_linear) or nil
+
+  return peak_db, rms_db, true
+end
+
 local function collect_all_regions_and_markers(options)
   local results = {}
   local index = 0
+  local analysis_context = options.include_audio_analysis and create_region_analysis_context() or nil
 
   while true do
     local retval, is_region, position, region_end, name, marker_index, native_color =
@@ -611,7 +783,7 @@ local function collect_all_regions_and_markers(options)
       }
 
       if options.include_audio_analysis and is_region then
-        entry.has_audio = range_has_audio(position, region_end)
+        entry.peak_dbfs, entry.rms_dbfs, entry.has_audio = analyze_region_audio(analysis_context, position, region_end)
       end
 
       results[#results + 1] = entry
@@ -627,6 +799,7 @@ local function collect_all_regions_and_markers(options)
     return left.position < right.position
   end)
 
+  destroy_region_analysis_context(analysis_context)
   return results
 end
 
@@ -731,8 +904,16 @@ local function build_text_report(data)
   local project_path = get_project_file_path()
   local project_name = get_project_name()
   local complete_count = (summary.status_totals.Done or 0) + (summary.status_totals.Approved or 0)
+  local show_peak = false
   local lines = {}
   local divider = string.rep("=", REPORT_WIDTH)
+
+  for _, entry in ipairs(data) do
+    if entry.peak_dbfs ~= nil then
+      show_peak = true
+      break
+    end
+  end
 
   lines[#lines + 1] = divider
   lines[#lines + 1] = "GAME SOUND ASSET WORKSHEET"
@@ -767,21 +948,38 @@ local function build_text_report(data)
 
     lines[#lines + 1] = string.format("%s (%d assets)", category_key, #category.items)
     lines[#lines + 1] = string.rep("-", REPORT_WIDTH)
-    lines[#lines + 1] = string.format("%-4s %-30s %-9s %-10s %-18s", "#", "Name", "Length", "Status", "Notes")
+    if show_peak then
+      lines[#lines + 1] = string.format("%-4s %-26s %-9s %-10s %-8s %-14s", "#", "Name", "Length", "Status", "Peak", "Notes")
+    else
+      lines[#lines + 1] = string.format("%-4s %-30s %-9s %-10s %-18s", "#", "Name", "Length", "Status", "Notes")
+    end
 
     for index, entry in ipairs(category.items) do
       local length_text = entry.length and (format_decimal(entry.length, 2) .. "s") or "marker"
       local status_text = canonicalize_status(entry.status) or entry.status or "Unset"
       local note_text = trim_string(entry.notes or "")
+      local peak_text = entry.peak_dbfs and (format_decimal(entry.peak_dbfs, 1) .. "dB") or "---"
 
-      lines[#lines + 1] = string.format(
-        "%-4s %-30s %-9s %-10s %-18s",
-        pad_left(index, 2),
-        truncate_string(get_display_item_name(entry), 30),
-        pad_left(length_text, 7),
-        pad_right(status_text, 10),
-        truncate_string(note_text, 18)
-      )
+      if show_peak then
+        lines[#lines + 1] = string.format(
+          "%-4s %-26s %-9s %-10s %-8s %-14s",
+          pad_left(index, 2),
+          truncate_string(get_display_item_name(entry), 26),
+          pad_left(length_text, 7),
+          pad_right(status_text, 10),
+          pad_left(peak_text, 8),
+          truncate_string(note_text, 14)
+        )
+      else
+        lines[#lines + 1] = string.format(
+          "%-4s %-30s %-9s %-10s %-18s",
+          pad_left(index, 2),
+          truncate_string(get_display_item_name(entry), 30),
+          pad_left(length_text, 7),
+          pad_right(status_text, 10),
+          truncate_string(note_text, 18)
+        )
+      end
     end
 
     lines[#lines + 1] = ""
@@ -856,6 +1054,61 @@ local function export_to_csv(data, filepath, options)
     row[#row + 1] = csv_escape(entry.notes or "")
     file:write(table.concat(row, ",") .. "\r\n")
   end
+
+  file:close()
+  return true
+end
+
+local function export_pivot_summary_csv(data, filepath, options)
+  ensure_directory(dirname(filepath))
+
+  local file = io.open(filepath, "wb")
+  if not file then
+    return false, "Cannot create pivot file: " .. tostring(filepath)
+  end
+
+  if options.add_bom then
+    file:write("\xEF\xBB\xBF")
+  end
+
+  local summary = summarize_entries(data)
+  local pivot_statuses = { "Done", "WIP", "Review", "Revision", "Todo", "Hold", "Approved", "Unset", "Unknown" }
+  local headers = { "Category" }
+  for _, status in ipairs(pivot_statuses) do
+    headers[#headers + 1] = status
+  end
+  headers[#headers + 1] = "Total"
+  file:write(table.concat(headers, ",") .. "\r\n")
+
+  local totals = {}
+  for _, status in ipairs(pivot_statuses) do
+    totals[status] = 0
+  end
+
+  for _, category_key in ipairs(sort_category_keys(summary.categories)) do
+    local category = summary.categories[category_key]
+    local row = { csv_escape(category_key) }
+    local category_total = 0
+
+    for _, status in ipairs(pivot_statuses) do
+      local count = category.status_totals[status] or 0
+      totals[status] = totals[status] + count
+      category_total = category_total + count
+      row[#row + 1] = tostring(count)
+    end
+
+    row[#row + 1] = tostring(category_total)
+    file:write(table.concat(row, ",") .. "\r\n")
+  end
+
+  local total_row = { "Total" }
+  local grand_total = 0
+  for _, status in ipairs(pivot_statuses) do
+    total_row[#total_row + 1] = tostring(totals[status])
+    grand_total = grand_total + totals[status]
+  end
+  total_row[#total_row + 1] = tostring(grand_total)
+  file:write(table.concat(total_row, ",") .. "\r\n")
 
   file:close()
   return true
@@ -1155,6 +1408,81 @@ local function get_duration_for_import(entry, region_start, default_duration)
   end
 
   return tonumber(default_duration) or 2.0, nil
+end
+
+local function has_explicit_variation(entry)
+  local explicit = coalesce_value(entry, { "variation" })
+  if explicit ~= "" then
+    return true
+  end
+
+  local raw_name = coalesce_value(entry, { "name", "region_name", "full_name" })
+  local _, _, _, variation = parse_asset_name(raw_name)
+  return variation ~= nil and variation ~= ""
+end
+
+local function detect_variation_count(entry)
+  local explicit = tonumber(coalesce_value(entry, {
+    "variation_count",
+    "variations",
+    "variation_total",
+    "variationtotal",
+  }))
+  if explicit and explicit > 1 then
+    return math.floor(explicit)
+  end
+
+  local search_text = table.concat({
+    coalesce_value(entry, { "notes" }),
+    coalesce_value(entry, { "memo" }),
+    coalesce_value(entry, { "description" }),
+    coalesce_value(entry, { "name" }),
+  }, " "):lower()
+
+  local patterns = {
+    "(%d+)%s*\236\162\133",
+    "(%d+)%s*variation[s]?",
+    "(%d+)%s*var[s]?",
+    "variation[s]?%s*(%d+)",
+    "var[s]?%s*(%d+)",
+  }
+
+  for _, pattern in ipairs(patterns) do
+    local count = tonumber(search_text:match(pattern))
+    if count and count > 1 then
+      return math.floor(count)
+    end
+  end
+
+  return 1
+end
+
+local function expand_import_entries(data, options)
+  if not options.auto_expand_variations then
+    return data, 0, 0
+  end
+
+  local expanded = {}
+  local source_rows_expanded = 0
+  local additional_rows = 0
+
+  for _, entry in ipairs(data) do
+    local count = detect_variation_count(entry)
+    if count > 1 and not has_explicit_variation(entry) then
+      source_rows_expanded = source_rows_expanded + 1
+      additional_rows = additional_rows + (count - 1)
+
+      for variation_index = 1, count do
+        local clone = shallow_copy(entry)
+        clone.variation = string.format("%02d", variation_index)
+        expanded[#expanded + 1] = clone
+      end
+    else
+      expanded[#expanded + 1] = entry
+    end
+  end
+
+  return expanded, source_rows_expanded, additional_rows
 end
 
 local function import_regions_from_data(data, options)
@@ -1629,6 +1957,205 @@ local function batch_set_status(status_name)
   return changed, has_time_selection
 end
 
+local function collect_scope_regions_for_edit()
+  local selection_start, selection_end = get_time_selection()
+  local has_time_selection = selection_end > selection_start
+  local regions = {}
+  local index = 0
+
+  while true do
+    local retval, is_region, position, region_end, name, marker_index, native_color =
+      reaper.EnumProjectMarkers3(0, index)
+
+    if retval == 0 then
+      break
+    end
+
+    if is_region and (not has_time_selection or (position < selection_end and region_end > selection_start)) then
+      regions[#regions + 1] = {
+        index = marker_index,
+        name = tostring(name or ""),
+        position = position,
+        region_end = region_end,
+        native_color = native_color or 0,
+      }
+    end
+
+    index = index + 1
+  end
+
+  return regions, has_time_selection
+end
+
+local function batch_rename_prefix_category(match_prefix, new_prefix, match_category, new_category)
+  local regions, has_time_selection = collect_scope_regions_for_edit()
+  local changed = 0
+
+  match_prefix = trim_string(match_prefix)
+  new_prefix = sanitize_name_part(new_prefix, "")
+  match_category = trim_string(match_category)
+  new_category = sanitize_name_part(new_category, "")
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+
+  for _, region in ipairs(regions) do
+    local prefix, category, asset_name, variation = parse_asset_name(region.name)
+    if prefix and asset_name then
+      local prefix_matches = match_prefix == "" or prefix == match_prefix
+      local category_matches = match_category == "" or category == match_category
+      if prefix_matches and category_matches then
+        local final_prefix = new_prefix ~= "" and new_prefix or prefix
+        local final_category = new_category ~= "" and new_category or category
+        local parts = {}
+        if final_prefix ~= "" then
+          parts[#parts + 1] = final_prefix
+        end
+        if trim_string(final_category or "") ~= "" then
+          parts[#parts + 1] = final_category
+        end
+        parts[#parts + 1] = asset_name
+        if variation and variation ~= "" then
+          parts[#parts + 1] = variation
+        end
+        local new_name = table.concat(parts, "_")
+
+        if new_name ~= region.name then
+          reaper.SetProjectMarker3(0, region.index, true, region.position, region.region_end, new_name, region.native_color)
+          changed = changed + 1
+        end
+      end
+    end
+  end
+
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock("Batch rename region prefix/category", -1)
+
+  return changed, has_time_selection, #regions
+end
+
+local function renumber_variations_in_scope()
+  local regions, has_time_selection = collect_scope_regions_for_edit()
+  local groups = {}
+
+  for _, region in ipairs(regions) do
+    local prefix, category, asset_name, variation = parse_asset_name(region.name)
+    local base_name = region.name
+    local group_key = nil
+    local existing_width = 2
+
+    if prefix and category and asset_name then
+      group_key = table.concat({ prefix or "", category or "", asset_name }, "|")
+      base_name = table.concat({ prefix, category, asset_name }, "_")
+      existing_width = math.max(existing_width, variation and #variation or 0)
+    else
+      local stripped, raw_variation = region.name:match("^(.-)_(%d+)$")
+      if stripped then
+        group_key = stripped
+        base_name = stripped
+        existing_width = math.max(existing_width, #raw_variation)
+        variation = raw_variation
+      end
+    end
+
+    if group_key then
+      if not groups[group_key] then
+        groups[group_key] = {
+          base_name = base_name,
+          items = {},
+          has_variation = false,
+          width = existing_width,
+        }
+      end
+      local group = groups[group_key]
+      group.items[#group.items + 1] = region
+      group.has_variation = group.has_variation or (variation ~= nil and variation ~= "")
+      group.width = math.max(group.width, existing_width)
+    end
+  end
+
+  local renamed = 0
+  local renamed_groups = 0
+
+  reaper.Undo_BeginBlock()
+  reaper.PreventUIRefresh(1)
+
+  for _, group in pairs(groups) do
+    if #group.items > 1 or group.has_variation then
+      table.sort(group.items, function(left, right)
+        if left.position == right.position then
+          return left.name < right.name
+        end
+        return left.position < right.position
+      end)
+
+      local width = math.max(2, group.width, #tostring(#group.items))
+      local group_changed = false
+
+      for index, region in ipairs(group.items) do
+        local target_name = string.format("%s_%0" .. tostring(width) .. "d", group.base_name, index)
+        if target_name ~= region.name then
+          reaper.SetProjectMarker3(0, region.index, true, region.position, region.region_end, target_name, region.native_color)
+          renamed = renamed + 1
+          group_changed = true
+        end
+      end
+
+      if group_changed then
+        renamed_groups = renamed_groups + 1
+      end
+    end
+  end
+
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock("Renumber region variations", -1)
+
+  return renamed, renamed_groups, has_time_selection, #regions
+end
+
+local function prompt_edit_status_colors()
+  local statuses = { "Done", "WIP", "Review", "Revision", "Todo", "Hold", "Approved" }
+  local captions = table.concat({
+    "separator=|",
+    "extrawidth=220",
+    "Done (#RRGGBB)",
+    "WIP (#RRGGBB)",
+    "Review (#RRGGBB)",
+    "Revision (#RRGGBB)",
+    "Todo (#RRGGBB)",
+    "Hold (#RRGGBB)",
+    "Approved (#RRGGBB)",
+  }, "|")
+
+  local defaults = {}
+  for _, status in ipairs(statuses) do
+    defaults[#defaults + 1] = format_hex_color(STATUS_COLORS[status])
+  end
+
+  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE .. " - Edit Status Colors", #statuses, captions, table.concat(defaults, "|"))
+  if not ok then
+    return false
+  end
+
+  local parts = split_delimited(values, "|", #statuses)
+  local updated = clone_status_colors(STATUS_COLORS)
+
+  for index, status in ipairs(statuses) do
+    local parsed = parse_hex_color(parts[index])
+    if not parsed then
+      reaper.ShowMessageBox("Invalid color for " .. status .. ". Use #RRGGBB.", SCRIPT_TITLE, 0)
+      return false
+    end
+    updated[status] = parsed
+  end
+
+  STATUS_COLORS = updated
+  save_status_colors()
+  return true
+end
+
 local function prompt_for_mode(settings)
   local captions = table.concat({
     "separator=|",
@@ -1660,6 +2187,7 @@ local function prompt_export_settings(settings)
     "Include Markers (yes/no)",
     "Only Time Selection (yes/no)",
     "Include Audio Analysis (yes/no)",
+    "Include Pivot Summary (yes/no)",
     "Output Format (csv/report/both)",
     "Output Path (empty=auto)",
     "Add UTF-8 BOM (yes/no)",
@@ -1671,26 +2199,28 @@ local function prompt_export_settings(settings)
     bool_to_string(settings.include_markers),
     bool_to_string(settings.only_time_selection),
     bool_to_string(settings.include_audio_analysis),
+    bool_to_string(settings.include_pivot_summary),
     tostring(settings.output_format),
     tostring(settings.export_path),
     bool_to_string(settings.add_bom),
     bool_to_string(settings.auto_open_export),
   }, "|")
 
-  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE .. " - Export", 8, captions, defaults)
+  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE .. " - Export", 9, captions, defaults)
   if not ok then
     return false
   end
 
-  local parts = split_delimited(values, "|", 8)
+  local parts = split_delimited(values, "|", 9)
   settings.include_regions = parse_boolean(parts[1], settings.include_regions)
   settings.include_markers = parse_boolean(parts[2], settings.include_markers)
   settings.only_time_selection = parse_boolean(parts[3], settings.only_time_selection)
   settings.include_audio_analysis = parse_boolean(parts[4], settings.include_audio_analysis)
-  settings.output_format = normalize_output_format(parts[5], settings.output_format)
-  settings.export_path = trim_string(parts[6])
-  settings.add_bom = parse_boolean(parts[7], settings.add_bom)
-  settings.auto_open_export = parse_boolean(parts[8], settings.auto_open_export)
+  settings.include_pivot_summary = parse_boolean(parts[5], settings.include_pivot_summary)
+  settings.output_format = normalize_output_format(parts[6], settings.output_format)
+  settings.export_path = trim_string(parts[7])
+  settings.add_bom = parse_boolean(parts[8], settings.add_bom)
+  settings.auto_open_export = parse_boolean(parts[9], settings.auto_open_export)
   return true
 end
 
@@ -1705,6 +2235,7 @@ local function prompt_import_settings(settings)
     "Default Prefix",
     "Skip Duplicates (yes/no)",
     "Auto Color by Status (yes/no)",
+    "Auto Expand Variations (yes/no)",
   }, "|")
 
   local defaults = table.concat({
@@ -1715,14 +2246,15 @@ local function prompt_import_settings(settings)
     tostring(settings.default_prefix),
     bool_to_string(settings.skip_duplicates),
     bool_to_string(settings.auto_color_by_status),
+    bool_to_string(settings.auto_expand_variations),
   }, "|")
 
-  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE .. " - Import", 7, captions, defaults)
+  local ok, values = reaper.GetUserInputs(SCRIPT_TITLE .. " - Import", 8, captions, defaults)
   if not ok then
     return false
   end
 
-  local parts = split_delimited(values, "|", 7)
+  local parts = split_delimited(values, "|", 8)
   settings.import_csv_path = trim_string(parts[1])
   settings.start_position = trim_string(parts[2])
   settings.gap_between_regions = math.max(0.0, tonumber(parts[3]) or settings.gap_between_regions)
@@ -1730,6 +2262,7 @@ local function prompt_import_settings(settings)
   settings.default_prefix = sanitize_name_part(parts[5], settings.default_prefix)
   settings.skip_duplicates = parse_boolean(parts[6], settings.skip_duplicates)
   settings.auto_color_by_status = parse_boolean(parts[7], settings.auto_color_by_status)
+  settings.auto_expand_variations = parse_boolean(parts[8], settings.auto_expand_variations)
   return true
 end
 
@@ -1808,7 +2341,7 @@ local function execute_export(settings)
     return
   end
 
-  local csv_path, report_path = resolve_export_paths(settings)
+  local csv_path, report_path, pivot_path = resolve_export_paths(settings)
   local output_format = normalize_output_format(settings.output_format, "csv")
   local report_text = build_text_report(data)
   local exported_paths = {}
@@ -1834,6 +2367,15 @@ local function execute_export(settings)
     exported_paths[#exported_paths + 1] = report_path
   end
 
+  if settings.include_pivot_summary then
+    local ok, error_message = export_pivot_summary_csv(data, pivot_path, settings)
+    if not ok then
+      reaper.ShowMessageBox(error_message, SCRIPT_TITLE, 0)
+      return
+    end
+    exported_paths[#exported_paths + 1] = pivot_path
+  end
+
   if settings.auto_open_export then
     for _, path in ipairs(exported_paths) do
       open_path_with_shell(path)
@@ -1855,7 +2397,11 @@ local function execute_export(settings)
 
   if settings.include_audio_analysis then
     message_lines[#message_lines + 1] = ""
-    message_lines[#message_lines + 1] = "Phase 1 note: audio analysis currently fills HasAudio only."
+    message_lines[#message_lines + 1] = "Peak/RMS region analysis was included in the export."
+  end
+
+  if settings.include_pivot_summary then
+    message_lines[#message_lines + 1] = "Pivot summary CSV was generated."
   end
 
   reaper.ShowMessageBox(table.concat(message_lines, "\n"), SCRIPT_TITLE, 0)
@@ -1878,12 +2424,19 @@ local function execute_import(settings)
     return
   end
 
+  local expanded_rows = 0
+  local source_rows_expanded = 0
+  data, source_rows_expanded, expanded_rows = expand_import_entries(data, settings)
+
   reaper.ClearConsole()
   log_line("===========================================")
   log_line("Game Sound Worksheet Import")
   log_line("Source: " .. settings.import_csv_path)
   log_line("Detected format: " .. tostring(import_kind_or_error))
   log_line("Rows: " .. tostring(#data))
+  if source_rows_expanded > 0 then
+    log_line(string.format("Variation expansion: %d source rows -> +%d extra rows", source_rows_expanded, expanded_rows))
+  end
   log_line("===========================================")
 
   local result = import_regions_from_data(data, settings)
@@ -1891,6 +2444,7 @@ local function execute_import(settings)
     string.format("Created regions: %d", result.created),
     string.format("Skipped duplicates: %d", result.skipped_duplicates),
     string.format("Skipped invalid rows: %d", result.skipped_invalid),
+    string.format("Variation-expanded rows: %d", expanded_rows),
   }, "\n")
 
   reaper.ShowMessageBox(message, SCRIPT_TITLE, 0)
@@ -2183,16 +2737,16 @@ local function execute_gui(settings)
 
   local function draw_status_legend(x, y, w)
     set_color(24, 27, 33, 1)
-    rect(x, y, w, 180, true, 10)
+    rect(x, y, w, 214, true, 10)
     set_color(57, 64, 76, 1)
-    rect(x, y, w, 180, false, 10)
+    rect(x, y, w, 214, false, 10)
     draw_panel_title(x + 14, y + 12, "Status Colors", "Detected from custom region colors")
 
     local chip_y = y + 54
     local chip_x = x + 14
     local col = 0
     for _, status in ipairs({ "Done", "WIP", "Review", "Revision", "Todo", "Hold", "Approved" }) do
-      local color = DEFAULT_STATUS_COLORS[status]
+      local color = STATUS_COLORS[status] or DEFAULT_STATUS_COLORS[status]
       set_color(color.r, color.g, color.b, 1)
       rect(chip_x + (col % 2) * 118, chip_y + math.floor(col / 2) * 30, 18, 18, true, 4)
       set_color(236, 240, 245, 1)
@@ -2201,13 +2755,20 @@ local function execute_gui(settings)
       gfx.drawstr(status)
       col = col + 1
     end
+
+    if button("edit_status_colors", x + 14, y + 176, w - 28, 28, "Edit Colors") then
+      if prompt_edit_status_colors() then
+        gui.needs_save = true
+        set_message("Status colors updated.")
+      end
+    end
   end
 
   local function draw_status_tools(x, y, w)
     set_color(24, 27, 33, 1)
-    rect(x, y, w, 240, true, 10)
+    rect(x, y, w, 308, true, 10)
     set_color(57, 64, 76, 1)
-    rect(x, y, w, 240, false, 10)
+    rect(x, y, w, 308, false, 10)
     draw_panel_title(x + 14, y + 12, "Status Tools", "Applies to regions inside the current time selection")
 
     local bx = x + 14
@@ -2231,6 +2792,47 @@ local function execute_gui(settings)
     if button("find_empty_regions", x + 14, y + 190, w - 28, 30, "Find Empty Regions") then
       show_empty_regions()
     end
+
+    if button("renumber_variations", x + 14, y + 226, w - 28, 30, "Re-number Variations") then
+      local renamed, groups, has_time_selection = renumber_variations_in_scope()
+      if renamed > 0 then
+        set_message(string.format("Renumbered %d regions across %d groups.", renamed, groups))
+      elseif has_time_selection then
+        set_message("No renumberable variation groups in the current time selection.")
+      else
+        set_message("No renumberable variation groups found in the project.")
+      end
+    end
+
+    if button("batch_rename_fields", x + 14, y + 262, w - 28, 30, "Batch Rename Prefix/Category") then
+      local captions = table.concat({
+        "separator=|",
+        "extrawidth=220",
+        "Match Prefix (empty=any)",
+        "New Prefix (empty=keep)",
+        "Match Category (empty=any)",
+        "New Category (empty=keep)",
+      }, "|")
+
+      local ok, values = reaper.GetUserInputs(
+        SCRIPT_TITLE .. " - Batch Rename",
+        4,
+        captions,
+        "|||"
+      )
+
+      if ok then
+        local parts = split_delimited(values, "|", 4)
+        local changed, has_time_selection = batch_rename_prefix_category(parts[1], parts[2], parts[3], parts[4])
+        if changed > 0 then
+          set_message(string.format("Batch-renamed %d regions.", changed))
+        elseif has_time_selection then
+          set_message("No matching parseable regions inside the current time selection.")
+        else
+          set_message("No matching parseable regions found in the project.")
+        end
+      end
+    end
   end
 
   local function draw_export_panel(x, y, w, h)
@@ -2246,21 +2848,22 @@ local function execute_gui(settings)
     settings.include_audio_analysis = apply_checkbox(settings.include_audio_analysis, "exp_audio", x + 200, y + 88, "Include Audio Analysis")
     settings.add_bom = apply_checkbox(settings.add_bom, "exp_bom", x + 16, y + 124, "Add UTF-8 BOM")
     settings.auto_open_export = apply_checkbox(settings.auto_open_export, "exp_open", x + 200, y + 124, "Auto-open Result")
+    settings.include_pivot_summary = apply_checkbox(settings.include_pivot_summary, "exp_pivot", x + 16, y + 160, "Include Pivot CSV")
 
-    draw_value_box(x + 16, y + 170, w - 172, "Output Path", settings.export_path == "" and "(auto: Project/Worksheets/...)" or settings.export_path)
-    if button("exp_path_edit", x + w - 144, y + 170, 128, 26, "Edit Path") then
+    draw_value_box(x + 16, y + 206, w - 172, "Output Path", settings.export_path == "" and "(auto: Project/Worksheets/...)" or settings.export_path)
+    if button("exp_path_edit", x + w - 144, y + 206, 128, 26, "Edit Path") then
       edit_export_path()
     end
-    if button("exp_path_clear", x + w - 144, y + 198, 128, 26, "Use Auto Path") then
+    if button("exp_path_clear", x + w - 144, y + 234, 128, 26, "Use Auto Path") then
       settings.export_path = ""
       mark_dirty("Export path reset to auto.")
     end
 
-    draw_value_box(x + 16, y + 240, 220, "Output Format", settings.output_format)
-    if button("exp_format", x + 248, y + 254, 120, 28, "Cycle Format") then
+    draw_value_box(x + 16, y + 276, 220, "Output Format", settings.output_format)
+    if button("exp_format", x + 248, y + 290, 120, 28, "Cycle Format") then
       cycle_output_format()
     end
-    if button("exp_dialog", x + 380, y + 254, 146, 28, "Advanced Dialog") then
+    if button("exp_dialog", x + 380, y + 290, 146, 28, "Advanced Dialog") then
       if prompt_export_settings(settings) then
         mark_dirty("Export settings updated.")
       end
@@ -2290,11 +2893,12 @@ local function execute_gui(settings)
 
     settings.skip_duplicates = apply_checkbox(settings.skip_duplicates, "imp_dup", x + 16, y + 194, "Skip Duplicates")
     settings.auto_color_by_status = apply_checkbox(settings.auto_color_by_status, "imp_color", x + 200, y + 194, "Auto Color by Status")
+    settings.auto_expand_variations = apply_checkbox(settings.auto_expand_variations, "imp_expand", x + 16, y + 230, "Auto Expand Variations")
 
-    if button("imp_edit_details", x + 16, y + 238, 170, 28, "Edit Timing/Prefix") then
+    if button("imp_edit_details", x + 16, y + 274, 170, 28, "Edit Timing/Prefix") then
       edit_import_details()
     end
-    if button("imp_dialog", x + 198, y + 238, 150, 28, "Advanced Dialog") then
+    if button("imp_dialog", x + 198, y + 274, 150, 28, "Advanced Dialog") then
       if prompt_import_settings(settings) then
         mark_dirty("Import settings updated.")
       end
@@ -2409,14 +3013,14 @@ local function execute_gui(settings)
     end
 
     draw_status_legend(right_x, 94, w - right_x - 20)
-    draw_status_tools(right_x, 286, w - right_x - 20)
+    draw_status_tools(right_x, 320, w - right_x - 20)
 
     set_color(24, 27, 33, 1)
-    rect(20, 438, w - 40, 152, true, 10)
+    rect(20, 438, left_w - 24, 152, true, 10)
     set_color(57, 64, 76, 1)
-    rect(20, 438, w - 40, 152, false, 10)
+    rect(20, 438, left_w - 24, 152, false, 10)
     draw_panel_title(34, 452, "Notes", "Current mode executes the same core functions as the dialog flow")
-    draw_value_box(34, 490, w - 68, "Message", gui.message)
+    draw_value_box(34, 490, left_w - 52, "Message", gui.message)
 
     if button("execute_main", 20, h - 58, 132, 36, "Execute") then
       execute_current_tab()
