@@ -688,7 +688,7 @@ local function prompt_naming_settings(settings)
   local ok, csv = reaper.GetUserInputs(
     SCRIPT_TITLE .. " - Naming",
     4,
-    "Prefix (SFX/AMB/MUS/UI/VO/FOL),Category,Case Style (pascal/snake),Naming Source (regions/track)",
+    "Prefix (custom or SFX/AMB/MUS/UI/VO/FOL),Category (custom text),Case Style (pascal/snake),Naming Source (regions/track)",
     table.concat({
       settings.prefix,
       settings.category,
@@ -1764,7 +1764,7 @@ local function gui_draw(settings, ui)
   gfx.rect(0, 0, gfx.w, gfx.h, 1)
 
   gui_draw_text(24, 18, SCRIPT_TITLE, 24, 0.96, 0.98, 1.0, 1)
-  gui_draw_text(24, 48, "Click a value to edit it. Menus are inline; text and numeric values open a small prompt.", 14, 0.72, 0.76, 0.82, 1)
+  gui_draw_text(24, 48, "Prefix and Category accept direct text input. Menus remain available as quick shortcuts.", 14, 0.72, 0.76, 0.82, 1)
 
   local margin = 20
   local section_w = gfx.w - margin * 2
@@ -1860,13 +1860,29 @@ local function gui_draw(settings, ui)
 
   gui_section(margin, 172, section_w, 174, "Naming Convention")
   gui_value_row(ui, margin + 18, 214, "Prefix", settings.prefix, function()
-    local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, PREFIX_OPTIONS, settings.prefix)
-    if selected then
-      settings.prefix = selected
+    local value = prompt_single_text(SCRIPT_TITLE .. " - Prefix", "Prefix", settings.prefix)
+    if value and value ~= "" then
+      settings.prefix = value
       save_settings(settings)
       ui.status_message = "Prefix updated."
     end
-  end)
+  end, {
+    value_w = 320,
+    extra_buttons = {
+      {
+        label = "Examples",
+        w = 110,
+        on_click = function()
+          local selected = show_option_menu(gfx.mouse_x, gfx.mouse_y, PREFIX_OPTIONS, settings.prefix)
+          if selected then
+            settings.prefix = selected
+            save_settings(settings)
+            ui.status_message = "Prefix updated from examples."
+          end
+        end,
+      },
+    },
+  })
   gui_value_row(ui, margin + 18, 250, "Category", settings.category, function()
     local value = prompt_single_text(SCRIPT_TITLE .. " - Category", "Category", settings.category)
     if value and value ~= "" then

@@ -628,6 +628,8 @@ local function seed_random(seed)
   math.random()
 end
 
+local get_applied_offset_ms
+
 local function build_variation_plan(source_items, settings, actual_seed)
   seed_random(actual_seed)
 
@@ -962,7 +964,7 @@ local function reverse_generated_items(items_to_reverse)
   reaper.Main_OnCommand(41051, 0)
 end
 
-local function get_applied_offset_ms(take, current_length, requested_offset_ms)
+get_applied_offset_ms = function(take, current_length, requested_offset_ms)
   if requested_offset_ms <= 0 then
     return 0.0
   end
@@ -1760,39 +1762,39 @@ local function draw_gui(gui)
   local left_y = y + 104
   local right_y = y + 104
 
-  draw_section_frame("Pitch Shift", x, left_y, col_w, 116)
+  draw_section_frame("Pitch Shift", x, left_y, col_w, 124)
   draw_checkbox(gui, x + 16, left_y + 38, "pitch_enabled", "Enable")
-  draw_input_field(gui, x + 16, left_y + 34, "Range", "pitch_range_cents", 90, "cent", 170)
-  draw_text("Distribution", x + 16, left_y + 72, GUI_COLORS.text)
-  local next_x = draw_radio(gui, x + 170, left_y + 71, "pitch_distribution", "uniform", "Uniform")
-  draw_radio(gui, next_x, left_y + 71, "pitch_distribution", "gaussian", "Gaussian")
+  draw_input_field(gui, x + 16, left_y + 62, "Range", "pitch_range_cents", 90, "cent", 170)
+  draw_text("Distribution", x + 16, left_y + 96, GUI_COLORS.text)
+  local next_x = draw_radio(gui, x + 170, left_y + 95, "pitch_distribution", "uniform", "Uniform")
+  draw_radio(gui, next_x, left_y + 95, "pitch_distribution", "gaussian", "Gaussian")
 
-  left_y = left_y + 128
-  draw_section_frame("Volume", x, left_y, col_w, 66)
+  left_y = left_y + 136
+  draw_section_frame("Volume", x, left_y, col_w, 84)
   draw_checkbox(gui, x + 16, left_y + 38, "volume_enabled", "Enable")
-  draw_input_field(gui, x + 16, left_y + 34, "Range", "volume_range_db", 90, "dB", 170)
+  draw_input_field(gui, x + 16, left_y + 52, "Range", "volume_range_db", 90, "dB", 170)
 
-  left_y = left_y + 78
-  draw_section_frame("Start Offset", x, left_y, col_w, 66)
+  left_y = left_y + 96
+  draw_section_frame("Start Offset", x, left_y, col_w, 84)
   draw_checkbox(gui, x + 16, left_y + 38, "start_offset_enabled", "Enable")
-  draw_input_field(gui, x + 16, left_y + 34, "Max", "start_offset_max_ms", 90, "ms", 170)
+  draw_input_field(gui, x + 16, left_y + 52, "Max", "start_offset_max_ms", 90, "ms", 170)
 
-  left_y = left_y + 78
-  draw_section_frame("Time Stretch", x, left_y, col_w, 92)
+  left_y = left_y + 96
+  draw_section_frame("Time Stretch", x, left_y, col_w, 112)
   draw_checkbox(gui, x + 16, left_y + 38, "time_stretch_enabled", "Enable")
-  draw_input_field(gui, x + 16, left_y + 34, "Range", "time_stretch_range_percent", 90, "%", 170)
-  draw_checkbox(gui, x + 16, left_y + 64, "time_stretch_preserve_pitch", "Preserve Pitch")
+  draw_input_field(gui, x + 16, left_y + 52, "Range", "time_stretch_range_percent", 90, "%", 170)
+  draw_checkbox(gui, x + 16, left_y + 82, "time_stretch_preserve_pitch", "Preserve Pitch")
 
-  draw_section_frame("Tone (EQ)", right_x, right_y, col_w, 66)
+  draw_section_frame("Tone (EQ)", right_x, right_y, col_w, 84)
   draw_checkbox(gui, right_x + 16, right_y + 38, "tone_enabled", "Enable")
-  draw_input_field(gui, right_x + 16, right_y + 34, "Shelf Gain", "tone_shelf_gain_db", 90, "dB", 170)
+  draw_input_field(gui, right_x + 16, right_y + 52, "Shelf Gain", "tone_shelf_gain_db", 90, "dB", 170)
 
-  right_y = right_y + 78
-  draw_section_frame("Reverse", right_x, right_y, col_w, 66)
+  right_y = right_y + 96
+  draw_section_frame("Reverse", right_x, right_y, col_w, 84)
   draw_checkbox(gui, right_x + 16, right_y + 38, "reverse_enabled", "Enable")
-  draw_input_field(gui, right_x + 16, right_y + 34, "Probability", "reverse_probability_percent", 90, "%", 170)
+  draw_input_field(gui, right_x + 16, right_y + 52, "Probability", "reverse_probability_percent", 90, "%", 170)
 
-  right_y = right_y + 78
+  right_y = right_y + 96
   draw_section_frame("Placement", right_x, right_y, col_w, 138)
   draw_text("Mode", right_x + 16, right_y + 38, GUI_COLORS.text)
   draw_radio(gui, right_x + 170, right_y + 37, "placement", "same_track", "Same track")

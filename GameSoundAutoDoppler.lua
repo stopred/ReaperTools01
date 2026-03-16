@@ -1515,6 +1515,30 @@ local function summarize_selection()
   return "No target items selected."
 end
 
+local function get_empty_target_message()
+  local selected_item_count = reaper.CountSelectedMediaItems(0)
+  local selected_track_count = reaper.CountSelectedTracks(0)
+  local selection_start, selection_end = get_time_selection()
+
+  if selected_item_count <= 0 and selected_track_count <= 0 then
+    return "No REAPER items or tracks are selected. Select item(s) in Arrange, or select track/folder headers, then press Apply."
+  end
+
+  if selection_start then
+    return string.format(
+      "Selection exists, but the active time selection (%s - %s) excludes all target items. Clear the time selection or move it over the items you want to process.",
+      format_seconds(selection_start),
+      format_seconds(selection_end)
+    )
+  end
+
+  if selected_track_count > 0 then
+    return "Track(s) are selected, but no media items were found on those track(s)."
+  end
+
+  return "No usable target items were found."
+end
+
 local backup_track_fx_actions_if_needed
 local restore_track_fx_backups
 local build_plugin_track_fx_actions
@@ -1684,7 +1708,7 @@ end
 
 local function process_targets(targets, settings, options)
   if #targets == 0 then
-    return false, "Select item(s) or track(s) first."
+    return false, get_empty_target_message()
   end
 
   options = options or {}
@@ -2830,7 +2854,7 @@ function M.main()
   ui_state.prev_left_down = false
   ui_state.prev_char = 0
   ui_state.should_close = false
-  ui_state.status_text = "Select items or tracks, then Apply."
+  ui_state.status_text = "Select item(s) in Arrange, or select track/folder headers. Active time selection limits processing."
   ui_state.imgui_open = false
   ui_state.selected_preset = get_selected_preset_slot()
 

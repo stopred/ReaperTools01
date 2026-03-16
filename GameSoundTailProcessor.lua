@@ -13,6 +13,7 @@
 
 local SCRIPT_TITLE = "Game Sound Tail/Silence Processor v1.0"
 local EXT_SECTION = "GameSoundTailProcessor"
+local BATCH_RENDER_EXT_SECTION = "GameSoundBatchRenderer"
 local REGION_MATCH_TOLERANCE_SEC = 0.01
 local NEG_INF_DB = -150.0
 
@@ -39,6 +40,56 @@ local DEFAULTS = {
   max_trim_ratio = 90.0,
   sync_regions = true,
   create_markers = false,
+}
+
+local BATCH_RENDER_DEFAULTS = {
+  prefix = "SFX",
+  category = "General",
+  case_style = "pascal",
+  naming_source = "regions",
+  render_scope = "selected_items",
+  sample_rate = 48000,
+  bit_depth = 24,
+  channels = 1,
+  output_path = "",
+  create_subfolders = true,
+  tail_ms = 0,
+  trim_silence = true,
+  trim_threshold_db = -60,
+  fade_out_ms = 0,
+  open_folder = false,
+}
+
+local BATCH_RENDER_NUMERIC_KEYS = {
+  "RENDER_SETTINGS",
+  "RENDER_BOUNDSFLAG",
+  "RENDER_STARTPOS",
+  "RENDER_ENDPOS",
+  "RENDER_SRATE",
+  "RENDER_CHANNELS",
+  "RENDER_TAILFLAG",
+  "RENDER_TAILMS",
+  "RENDER_ADDTOPROJ",
+  "RENDER_NORMALIZE",
+  "RENDER_NORMALIZE_TARGET",
+  "RENDER_BRICKWALL",
+  "RENDER_FADEIN",
+  "RENDER_FADEOUT",
+  "RENDER_FADEINSHAPE",
+  "RENDER_FADEOUTSHAPE",
+  "RENDER_FADELPF",
+  "RENDER_PADSTART",
+  "RENDER_PADEND",
+  "RENDER_TRIMSTART",
+  "RENDER_TRIMEND",
+  "RENDER_DELAY",
+}
+
+local BATCH_RENDER_STRING_KEYS = {
+  "RENDER_FILE",
+  "RENDER_PATTERN",
+  "RENDER_FORMAT",
+  "RENDER_FORMAT2",
 }
 
 local HUMAN_TAIL_MODE = {
@@ -153,6 +204,36 @@ end
 
 local function ms_to_sec(value)
   return (tonumber(value) or 0.0) / 1000.0
+end
+
+local function normalize_path(path)
+  local normalized = trim_string(path):gsub("\\", "/")
+  local unc_prefix = normalized:match("^//") and "//" or ""
+  if unc_prefix ~= "" then
+    normalized = normalized:sub(3)
+  end
+  normalized = normalized:gsub("/+", "/")
+  normalized = normalized:gsub("/$", "")
+  return unc_prefix .. normalized
+end
+
+local function join_paths(left, right)
+  local lhs = normalize_path(left)
+  local rhs = normalize_path(right)
+
+  if lhs == "" then
+    return rhs
+  end
+  if rhs == "" then
+    return lhs
+  end
+
+  return lhs .. "/" .. rhs
+end
+
+local function is_absolute_path(path)
+  local value = trim_string(path)
+  return value:match("^%a:[/\\]") ~= nil or value:match("^[/\\][/\\]") ~= nil
 end
 
 local function strip_extension(name)
@@ -291,6 +372,52 @@ local function normalize_category_text(text)
   return table.concat(entries, ";")
 end
 
+local function batch_get_project_info_string(key)
+  local _, value = reaper.GetSetProjectInfo_String(0, key, "", false)
+  return value or ""
+end
+
+local function batch_set_project_info_string(key, value)
+  reaper.GetSetProjectInfo_String(0, key, tostring(value or ""), true)
+end
+
+local function base64_encode(data)
+  local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local output = {}
+  local padding = ({ "", "==", "=" })[(#data % 3) + 1]
+
+  data = data .. string.rep("\0", (3 - #data % 3) % 3)
+
+  for index = 1, #data, 3 do
+    local a, b, c = data:byte(index, index + 2)
+    local value = a * 65536 + b * 256 + c
+
+    local i1 = math.floor(value / 262144) % 64 + 1
+    local i2 = math.floor(value / 4096) % 64 + 1
+    local i3 = math.floor(value / 64) % 64 + 1
+    local i4 = value % 64 + 1
+
+    output[#output + 1] = alphabet:sub(i1, i1)
+    output[#output + 1] = alphabet:sub(i2, i2)
+    output[#output + 1] = alphabet:sub(i3, i3)
+    output[#output + 1] = alphabet:sub(i4, i4)
+  end
+
+  if padding ~= "" then
+    output[#output] = padding:sub(#padding, #padding)
+    if #padding == 2 then
+      output[#output - 1] = padding:sub(1, 1)
+    end
+  end
+
+  return table.concat(output)
+end
+
+local function build_wave_render_format(bit_depth)
+  local raw = string.char(101, 118, 97, 119, bit_depth, 0, 0)
+  return base64_encode(raw)
+end
+
 local function load_settings()
   local settings = {}
 
@@ -348,6 +475,65 @@ local function save_settings(settings)
   reaper.SetExtState(EXT_SECTION, "max_trim_ratio", tostring(settings.max_trim_ratio), true)
   reaper.SetExtState(EXT_SECTION, "sync_regions", bool_to_string(settings.sync_regions), true)
   reaper.SetExtState(EXT_SECTION, "create_markers", bool_to_string(settings.create_markers), true)
+end
+
+local function load_batch_render_settings()
+  local settings = {}
+  for key, default_value in pairs(BATCH_RENDER_DEFAULTS) do
+    local stored = reaper.GetExtState(BATCH_RENDER_EXT_SECTION, key)
+    if stored == "" then
+      settings[key] = default_value
+    elseif type(default_value) == "boolean" then
+      settings[key] = parse_boolean(stored, default_value)
+    elseif type(default_value) == "number" then
+      settings[key] = tonumber(stored) or default_value
+    else
+      settings[key] = stored
+    end
+  end
+
+  settings.render_scope = "selected_items"
+  if settings.case_style ~= "snake" then
+    settings.case_style = "pascal"
+  end
+  if settings.naming_source ~= "track" then
+    settings.naming_source = "regions"
+  end
+  if settings.sample_rate ~= 44100 and settings.sample_rate ~= 48000 and settings.sample_rate ~= 96000 then
+    settings.sample_rate = BATCH_RENDER_DEFAULTS.sample_rate
+  end
+  if settings.bit_depth ~= 16 and settings.bit_depth ~= 24 and settings.bit_depth ~= 32 then
+    settings.bit_depth = BATCH_RENDER_DEFAULTS.bit_depth
+  end
+  if settings.channels ~= 1 and settings.channels ~= 2 then
+    settings.channels = BATCH_RENDER_DEFAULTS.channels
+  end
+
+  return settings
+end
+
+local function get_default_render_output_root()
+  return join_paths(reaper.GetProjectPath(""), "Renders")
+end
+
+local function get_render_output_directory(settings)
+  local configured = trim_string(settings.output_path)
+  local output_root = configured == "" and get_default_render_output_root()
+    or (is_absolute_path(configured) and normalize_path(configured) or join_paths(reaper.GetProjectPath(""), configured))
+
+  if settings.create_subfolders then
+    local folder_name = trim_string(settings.prefix):upper()
+    folder_name = folder_name:gsub("[%s\\/:*?\"<>|]+", "_")
+    folder_name = folder_name:gsub("_+", "_")
+    folder_name = folder_name:gsub("^_+", "")
+    folder_name = folder_name:gsub("_+$", "")
+    if folder_name == "" then
+      folder_name = "OUTPUT"
+    end
+    return join_paths(output_root, folder_name)
+  end
+
+  return output_root
 end
 
 local function prompt_for_settings(current)
@@ -532,6 +718,43 @@ local function get_take_name_or_fallback(take, fallback_index)
   end
 
   return string.format("Item_%02d", fallback_index or 1)
+end
+
+local function tokenize_name(value)
+  local sanitized = tostring(value or "")
+  sanitized = sanitized:gsub("[%c]", " ")
+  sanitized = sanitized:gsub("[_%-%.]+", " ")
+  sanitized = sanitized:gsub("(%l)(%u)", "%1 %2")
+  sanitized = sanitized:gsub("[^%w%s]+", " ")
+
+  local tokens = {}
+  for token in sanitized:gmatch("%S+") do
+    tokens[#tokens + 1] = token
+  end
+  return tokens
+end
+
+local function format_segment(raw_text, case_style)
+  local tokens = tokenize_name(raw_text)
+  local formatted = {}
+
+  for _, token in ipairs(tokens) do
+    if case_style == "snake" then
+      formatted[#formatted + 1] = token:lower()
+    else
+      formatted[#formatted + 1] = token:sub(1, 1):upper() .. token:sub(2):lower()
+    end
+  end
+
+  return table.concat(formatted, "_")
+end
+
+local function format_prefix(raw_text)
+  local tokens = tokenize_name(raw_text)
+  for index, token in ipairs(tokens) do
+    tokens[index] = token:upper()
+  end
+  return table.concat(tokens, "_")
 end
 
 local function frame_exceeds_threshold(buffer, frame_index, num_channels, threshold_linear)
@@ -1395,10 +1618,11 @@ local function csv_escape(value)
 end
 
 local function ensure_directory(path)
-  if trim_string(path) == "" then
+  local normalized = normalize_path(path)
+  if normalized == "" then
     return false
   end
-  reaper.RecursiveCreateDirectory(path, 0)
+  reaper.RecursiveCreateDirectory(normalized, 0)
   return true
 end
 
@@ -1481,6 +1705,248 @@ local function add_before_after_markers(plan)
   end
 
   return created
+end
+
+local function backup_batch_render_state()
+  local backup = { numeric = {}, string = {} }
+  for _, key in ipairs(BATCH_RENDER_NUMERIC_KEYS) do
+    backup.numeric[key] = reaper.GetSetProjectInfo(0, key, 0, false)
+  end
+  for _, key in ipairs(BATCH_RENDER_STRING_KEYS) do
+    backup.string[key] = batch_get_project_info_string(key)
+  end
+  return backup
+end
+
+local function restore_batch_render_state(backup)
+  if not backup then
+    return
+  end
+  for _, key in ipairs(BATCH_RENDER_NUMERIC_KEYS) do
+    if backup.numeric[key] ~= nil then
+      reaper.GetSetProjectInfo(0, key, backup.numeric[key], true)
+    end
+  end
+  for _, key in ipairs(BATCH_RENDER_STRING_KEYS) do
+    if backup.string[key] ~= nil then
+      batch_set_project_info_string(key, backup.string[key])
+    end
+  end
+end
+
+local function select_single_item(item)
+  reaper.SelectAllMediaItems(0, false)
+  if item then
+    reaper.SetMediaItemSelected(item, true)
+  end
+  reaper.UpdateArrange()
+end
+
+local function open_output_folder(path)
+  local normalized = normalize_path(path)
+  if normalized == "" then
+    return
+  end
+  os.execute('explorer "' .. normalized .. '"')
+end
+
+local function apply_batch_common_render_settings(settings)
+  reaper.GetSetProjectInfo(0, "RENDER_SRATE", settings.sample_rate, true)
+  reaper.GetSetProjectInfo(0, "RENDER_CHANNELS", settings.channels, true)
+  reaper.GetSetProjectInfo(0, "RENDER_ADDTOPROJ", 0, true)
+  batch_set_project_info_string("RENDER_FORMAT", build_wave_render_format(settings.bit_depth))
+  batch_set_project_info_string("RENDER_FORMAT2", "")
+
+  local normalize_flags = 0
+  if settings.trim_silence then
+    normalize_flags = normalize_flags | 16384 | 32768
+    local threshold = clamp_number(db_to_linear(settings.trim_threshold_db), 0, 1)
+    reaper.GetSetProjectInfo(0, "RENDER_TRIMSTART", threshold, true)
+    reaper.GetSetProjectInfo(0, "RENDER_TRIMEND", threshold, true)
+  else
+    reaper.GetSetProjectInfo(0, "RENDER_TRIMSTART", 0, true)
+    reaper.GetSetProjectInfo(0, "RENDER_TRIMEND", 0, true)
+  end
+
+  if settings.fade_out_ms > 0 then
+    normalize_flags = normalize_flags | 1024
+    reaper.GetSetProjectInfo(0, "RENDER_FADEOUT", settings.fade_out_ms / 1000.0, true)
+    reaper.GetSetProjectInfo(0, "RENDER_FADEOUTSHAPE", 0, true)
+  else
+    reaper.GetSetProjectInfo(0, "RENDER_FADEOUT", 0, true)
+    reaper.GetSetProjectInfo(0, "RENDER_FADEOUTSHAPE", 0, true)
+  end
+
+  reaper.GetSetProjectInfo(0, "RENDER_FADEIN", 0, true)
+  reaper.GetSetProjectInfo(0, "RENDER_FADEINSHAPE", 0, true)
+  reaper.GetSetProjectInfo(0, "RENDER_FADELPF", 0, true)
+  reaper.GetSetProjectInfo(0, "RENDER_PADSTART", 0, true)
+  reaper.GetSetProjectInfo(0, "RENDER_PADEND", 0, true)
+  reaper.GetSetProjectInfo(0, "RENDER_DELAY", 0, true)
+  reaper.GetSetProjectInfo(0, "RENDER_NORMALIZE", normalize_flags, true)
+
+  if settings.tail_ms > 0 then
+    reaper.GetSetProjectInfo(0, "RENDER_TAILFLAG", 16, true)
+    reaper.GetSetProjectInfo(0, "RENDER_TAILMS", settings.tail_ms, true)
+  else
+    reaper.GetSetProjectInfo(0, "RENDER_TAILFLAG", 0, true)
+    reaper.GetSetProjectInfo(0, "RENDER_TAILMS", 0, true)
+  end
+end
+
+local function build_render_jobs_from_plans(plans, render_settings)
+  local jobs = {}
+  local output_dir = get_render_output_directory(render_settings)
+  local prefix = format_prefix(render_settings.prefix)
+  local category = format_segment(render_settings.category, render_settings.case_style)
+  local variation_by_stem = {}
+
+  if prefix == "" then
+    return nil, "Render prefix is empty. Configure GameSoundBatchRenderer settings first."
+  end
+  if category == "" then
+    return nil, "Render category is empty. Configure GameSoundBatchRenderer settings first."
+  end
+
+  for _, plan in ipairs(plans or {}) do
+    if not plan.skip and plan.item then
+      local raw_asset_name = nil
+      if render_settings.naming_source == "regions" and plan.analysis.region_names and plan.analysis.region_names[1] then
+        raw_asset_name = plan.analysis.region_names[1]
+      end
+      if trim_string(raw_asset_name) == "" then
+        raw_asset_name = trim_string(plan.analysis.track_name)
+      end
+      if trim_string(raw_asset_name) == "" then
+        raw_asset_name = plan.analysis.take_name
+      end
+
+      local asset_name = format_segment(raw_asset_name, render_settings.case_style)
+      if asset_name == "" then
+        asset_name = "Asset"
+      end
+
+      local stem_key = string.lower(prefix .. "|" .. category .. "|" .. asset_name)
+      variation_by_stem[stem_key] = (variation_by_stem[stem_key] or 0) + 1
+
+      local variation = string.format("%02d", variation_by_stem[stem_key])
+      local file_stem = string.format("%s_%s_%s_%s", prefix, category, asset_name, variation)
+      jobs[#jobs + 1] = {
+        item = plan.item,
+        file_stem = file_stem,
+        output_dir = output_dir,
+        file_path = join_paths(output_dir, file_stem .. ".wav"),
+        source_label = plan.analysis.take_name,
+      }
+    end
+  end
+
+  if #jobs == 0 then
+    return nil, "No processed audio items are available to render."
+  end
+
+  return jobs
+end
+
+local function inspect_render_job_conflicts(jobs)
+  local generated_duplicates = {}
+  local existing_files = {}
+  local seen = {}
+
+  for _, job in ipairs(jobs or {}) do
+    local key = string.lower(job.file_path)
+    if seen[key] then
+      generated_duplicates[#generated_duplicates + 1] = job.file_path
+    else
+      seen[key] = true
+    end
+
+    if reaper.file_exists(job.file_path) then
+      existing_files[#existing_files + 1] = job.file_path
+    end
+  end
+
+  return generated_duplicates, existing_files
+end
+
+local function confirm_existing_render_files(existing_files)
+  if #existing_files == 0 then
+    return true
+  end
+
+  local preview_limit = math.min(#existing_files, 8)
+  local lines = {
+    "Existing files were found and may be overwritten:",
+    "",
+  }
+
+  for index = 1, preview_limit do
+    lines[#lines + 1] = existing_files[index]
+  end
+  if #existing_files > preview_limit then
+    lines[#lines + 1] = string.format("...and %d more", #existing_files - preview_limit)
+  end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Continue?"
+
+  return reaper.ShowMessageBox(table.concat(lines, "\n"), SCRIPT_TITLE, 4) == 6
+end
+
+local function render_jobs_in_place(render_settings, jobs, selected_items)
+  local output_dir = get_render_output_directory(render_settings)
+  if not ensure_directory(output_dir) then
+    return false, "Failed to create output directory:\n" .. output_dir
+  end
+
+  local render_state_backup = backup_batch_render_state()
+  local selected_backup = clone_table(selected_items or {})
+  local success_count = 0
+  local started_at = reaper.time_precise()
+
+  local ok, err = xpcall(function()
+    for index, job in ipairs(jobs) do
+      log_line(string.format("[Render %d/%d] %s", index, #jobs, job.file_path))
+      ensure_directory(job.output_dir)
+      batch_set_project_info_string("RENDER_FILE", job.output_dir)
+      batch_set_project_info_string("RENDER_PATTERN", job.file_stem)
+      select_single_item(job.item)
+      reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 64, true)
+      reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 4, true)
+      reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0, true)
+      reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", 0, true)
+      apply_batch_common_render_settings(render_settings)
+      reaper.Main_OnCommand(42230, 0)
+
+      if reaper.file_exists(job.file_path) then
+        success_count = success_count + 1
+      else
+        log_line("  Warning: file was not found after render -> " .. job.file_path)
+      end
+    end
+  end, function(message)
+    return debug.traceback(message, 2)
+  end)
+
+  restore_batch_render_state(render_state_backup)
+  select_only_items(selected_backup)
+
+  if not ok then
+    return false, err
+  end
+
+  local summary = string.format(
+    "Render complete.\nFiles rendered: %d/%d\nOutput path: %s\nElapsed: %.2f sec",
+    success_count,
+    #jobs,
+    output_dir,
+    reaper.time_precise() - started_at
+  )
+
+  if render_settings.open_folder then
+    open_output_folder(output_dir)
+  end
+
+  return true, summary
 end
 
 local GUI = {
@@ -1745,7 +2211,46 @@ local function run_action(state, action)
 
   print_final_summary(action_plans, action_settings, result_or_err)
 
-  if action == "process" then
+  if action == "process_render" then
+    local render_settings = load_batch_render_settings()
+    local jobs, jobs_err = build_render_jobs_from_plans(action_plans, render_settings)
+    if not jobs then
+      reaper.ShowMessageBox(jobs_err or "Failed to prepare render jobs.", SCRIPT_TITLE, 0)
+      set_status(state, "Processed, but render job preparation failed.")
+      run_analysis_pass(state)
+      return
+    end
+
+    local generated_duplicates, existing_files = inspect_render_job_conflicts(jobs)
+    if #generated_duplicates > 0 then
+      reaper.ShowMessageBox(
+        "Duplicate generated render file names were detected:\n\n" .. table.concat(generated_duplicates, "\n"),
+        SCRIPT_TITLE,
+        0
+      )
+      set_status(state, "Processed, but render names conflicted.")
+      run_analysis_pass(state)
+      return
+    end
+    if not confirm_existing_render_files(existing_files) then
+      set_status(state, "Processed. Render canceled.")
+      run_analysis_pass(state)
+      return
+    end
+
+    log_line("")
+    log_line("[Tail Processor] Starting render with GameSoundBatchRenderer settings.")
+    local render_ok, render_result = render_jobs_in_place(render_settings, jobs, state.selected_items)
+    log_line(render_result)
+    if render_ok then
+      reaper.ShowMessageBox(render_result, SCRIPT_TITLE, 0)
+      set_status(state, string.format("Processed %d items and rendered %d files.", result_or_err.processed_count or 0, #jobs))
+    else
+      reaper.ShowMessageBox("Render failed:\n\n" .. tostring(render_result), SCRIPT_TITLE, 0)
+      set_status(state, "Processed, but render failed.")
+    end
+    run_analysis_pass(state)
+  elseif action == "process" then
     run_analysis_pass(state)
     set_status(state, string.format(
       "Processed %d items. Regions: %d, Markers: %d.",
@@ -1993,10 +2498,13 @@ local function draw_gui(state)
   if draw_button(state, GUI.padding + 290, toolbar_y, 118, 30, "Process All", { enabled = true }) then
     run_action(state, "process")
   end
-  if draw_button(state, GUI.padding + 418, toolbar_y, 102, 30, "Export CSV", { enabled = true }) then
+  if draw_button(state, GUI.padding + 418, toolbar_y, 140, 30, "Process + Render", { enabled = true }) then
+    run_action(state, "process_render")
+  end
+  if draw_button(state, GUI.padding + 568, toolbar_y, 102, 30, "Export CSV", { enabled = true }) then
     run_export_action(state)
   end
-  if draw_button(state, GUI.padding + 530, toolbar_y, 110, 30, "Quick Setup", { enabled = true }) then
+  if draw_button(state, GUI.padding + 680, toolbar_y, 110, 30, "Quick Setup", { enabled = true }) then
     adopt_prompt_settings(state)
   end
   if draw_button(state, window_w - GUI.padding - 96, toolbar_y, 96, 30, "Close", { enabled = true }) then
@@ -2004,7 +2512,7 @@ local function draw_gui(state)
   end
 
   local stale_text = state.analysis_dirty and "Analysis stale" or (state.process_dirty and "Plan stale" or "Ready")
-  draw_text(GUI.padding + 654, toolbar_y + 7, stale_text, state.analysis_dirty and 230 or 150, state.analysis_dirty and 180 or 208, 120, 255)
+  draw_text(GUI.padding + 804, toolbar_y + 7, stale_text, state.analysis_dirty and 230 or 150, state.analysis_dirty and 180 or 208, 120, 255)
 
   local left_w = 336
   local right_x = GUI.padding + left_w + GUI.section_gap
@@ -2015,6 +2523,7 @@ local function draw_gui(state)
   set_color(38, 42, 48, 255)
   gfx.rect(0, footer_y - 6, window_w, 36, true)
   draw_text(GUI.padding, footer_y, state.status_message or "Ready.", 220, 224, 230, 255)
+  draw_text(GUI.padding + 520, footer_y, "Process + Render uses GameSoundBatchRenderer saved render settings.", 156, 164, 174, 255)
   if #state.analyses > 0 then
     draw_text(window_w - 260, footer_y, string.format("Rows: %d  Scroll: %d", #state.analyses, state.results_scroll), 156, 164, 174, 255)
   end
